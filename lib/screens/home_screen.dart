@@ -15,6 +15,7 @@ import 'settings_screen.dart';
 import 'task_history_screen.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import '../main.dart';
+import '../config/feature_flags.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -234,6 +235,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _showTaskProgressOverlay(String message) async {
+    if (!FeatureFlags.floatingOverlayEnabled) return;
     if (!await FlutterOverlayWindow.isPermissionGranted()) return;
 
     // Never cover PrivateAgent itself. The lifecycle observer will create the
@@ -262,6 +264,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   void _sendOverlayEvent(String type, String message) {
+    if (!FeatureFlags.floatingOverlayEnabled) return;
     final safeMessage = message.replaceAll('|', ' ');
     unawaited(
       FlutterOverlayWindow.shareData(
@@ -271,6 +274,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _sendOverlayHistorySnapshot() async {
+    if (!FeatureFlags.floatingOverlayEnabled) return;
     final history = base64Encode(
       utf8.encode(
         jsonEncode(_messages.map((message) => message.toJson()).toList()),
@@ -370,6 +374,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _startOverlayHistorySync() {
     _overlayHistoryTimer?.cancel();
+    if (!FeatureFlags.floatingOverlayEnabled) return;
     unawaited(_importOverlayChatHistory());
     _overlayHistoryTimer = Timer.periodic(const Duration(milliseconds: 500), (
       _,
@@ -386,6 +391,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _importOverlayChatHistory() async {
+    if (!FeatureFlags.floatingOverlayEnabled) return;
     if (_importingOverlayHistory) return;
     _importingOverlayHistory = true;
     try {
@@ -412,6 +418,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _importingOverlayHistory = false;
 
   Future<void> _updateOverlayState() async {
+    if (!FeatureFlags.floatingOverlayEnabled) return;
     final generation = ++_overlayUpdateGeneration;
     final isBackground = _appLifecycleState == AppLifecycleState.paused;
     final shouldBeActive = isBackground;

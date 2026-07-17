@@ -3,6 +3,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import 'dart:ui';
+import '../config/feature_flags.dart';
 import '../services/ai_service.dart';
 import '../services/screen_automation_service.dart';
 import 'home_screen.dart';
@@ -87,7 +88,9 @@ class _OnboardingScreenState extends State<OnboardingScreen>
     final contactsStatus = await Permission.contacts.status;
     final phoneStatus = await Permission.phone.status;
     final smsStatus = await Permission.sms.status;
-    final overlayGranted = await FlutterOverlayWindow.isPermissionGranted();
+    final overlayGranted = FeatureFlags.floatingOverlayEnabled
+        ? await FlutterOverlayWindow.isPermissionGranted()
+        : false;
 
     if (mounted) {
       setState(() {
@@ -108,10 +111,38 @@ class _OnboardingScreenState extends State<OnboardingScreen>
   }
 
   Future<void> _requestAccessibility() async {
-    await _screenAutomationService.openAccessibilitySettings();
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Enable Screen Control'),
+        content: const Text(
+          'If Android shows “Restricted setting”, open App Info first, tap the '
+          'three-dot menu, and choose “Allow restricted settings”. Then return '
+          'and open Accessibility Settings to enable PrivateAgent Screen Control.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(dialogContext);
+              _screenAutomationService.openAccessibilitySettings();
+            },
+            child: const Text('Accessibility Settings'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(dialogContext);
+              openAppSettings();
+            },
+            child: const Text('Open App Info First'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _requestOverlayPermission() async {
+    if (!FeatureFlags.floatingOverlayEnabled) return;
     bool granted = await FlutterOverlayWindow.isPermissionGranted();
     if (!granted) {
       await FlutterOverlayWindow.requestPermission();
@@ -363,7 +394,9 @@ class _OnboardingScreenState extends State<OnboardingScreen>
   }
 
   bool get _canProceedToModel {
-    return _isAccessibilityGranted && _isMicrophoneGranted && _isOverlayGranted;
+    return _isAccessibilityGranted &&
+        _isMicrophoneGranted &&
+        (!FeatureFlags.floatingOverlayEnabled || _isOverlayGranted);
   }
 
   @override
@@ -792,15 +825,17 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                   () => _requestPermission(Permission.microphone),
                   isDark,
                 ),
-                const SizedBox(height: 12),
-                _buildPermissionCard(
-                  'Display Over Other Apps (Floating Bubble)',
-                  'Allows PrivateAgent to show a floating overlay bubble when backgrounded or executing a task so you can monitor progress and execute actions.',
-                  Icons.layers_rounded,
-                  _isOverlayGranted,
-                  _requestOverlayPermission,
-                  isDark,
-                ),
+                if (FeatureFlags.floatingOverlayEnabled) ...[
+                  const SizedBox(height: 12),
+                  _buildPermissionCard(
+                    'Display Over Other Apps (Floating Bubble)',
+                    'Allows PrivateAgent to show a floating overlay bubble when backgrounded or executing a task so you can monitor progress and execute actions.',
+                    Icons.layers_rounded,
+                    _isOverlayGranted,
+                    _requestOverlayPermission,
+                    isDark,
+                  ),
+                ],
                 const SizedBox(height: 20),
                 _buildSectionHeader('OPTIONAL', isDark),
                 _buildPermissionCard(
