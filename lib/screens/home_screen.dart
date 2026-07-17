@@ -115,10 +115,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     try {
       final isAgent = _mode == 'agent';
-      final stream = _aiService.sendMessageStream(
-        text.trim(),
-        isAgentMode: isAgent,
-      );
+      final stream = _aiService
+          .sendMessageStream(text.trim(), isAgentMode: isAgent)
+          .timeout(
+            const Duration(seconds: 90),
+            onTimeout: (sink) {
+              sink.addError(
+                TimeoutException(
+                  'The model did not return visible text within 90 seconds.',
+                ),
+              );
+              sink.close();
+            },
+          );
       String accumulated = '';
 
       await for (final chunk in stream) {

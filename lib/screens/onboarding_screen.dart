@@ -132,6 +132,9 @@ class _OnboardingScreenState extends State<OnboardingScreen>
       } else if (provider == 'groq') {
         _baseUrlController.text = 'https://api.groq.com/openai/v1';
         _modelController.text = 'llama-3.3-70b-versatile';
+      } else if (provider == 'nvidia') {
+        _baseUrlController.text = AiService.nvidiaBaseUrl;
+        _modelController.text = AiService.nvidiaDefaultModel;
       } else if (provider == 'ollama') {
         _baseUrlController.text = 'http://10.0.2.2:11434/v1';
         _modelController.text = 'gemma2';
@@ -289,7 +292,9 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Select a Model',
+                      AiService.isNvidiaBaseUrl(baseUrl)
+                          ? 'Select a Free NVIDIA Model'
+                          : 'Select a Model',
                       style: TextStyle(
                         fontSize: 18,
                         fontWeight: FontWeight.bold,
@@ -1082,6 +1087,13 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                 ),
                 const SizedBox(width: 10),
                 _buildProviderCard('groq', 'Groq', Icons.speed_rounded, isDark),
+                const SizedBox(width: 10),
+                _buildProviderCard(
+                  'nvidia',
+                  'NVIDIA',
+                  Icons.memory_rounded,
+                  isDark,
+                ),
                 const SizedBox(width: 10),
                 _buildProviderCard(
                   'ollama',
