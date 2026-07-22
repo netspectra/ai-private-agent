@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import 'dart:ui';
 import '../config/feature_flags.dart';
+import '../widgets/searchable_model_picker.dart';
 import '../services/ai_service.dart';
 import '../services/screen_automation_service.dart';
 import 'home_screen.dart';
@@ -306,71 +307,16 @@ class _OnboardingScreenState extends State<OnboardingScreen>
         return;
       }
 
-      if (mounted) {
-        final isDark = Theme.of(context).brightness == Brightness.dark;
-        showModalBottomSheet(
-          context: context,
-          backgroundColor: isDark ? const Color(0xFF161329) : Colors.white,
-          shape: const RoundedRectangleBorder(
-            borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-          ),
-          builder: (context) {
-            return SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      AiService.isNvidiaBaseUrl(baseUrl)
-                          ? 'Select a Free NVIDIA Model'
-                          : 'Select a Model',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                        color: isDark ? Colors.white : Colors.black87,
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    Expanded(
-                      child: ListView.builder(
-                        physics: const BouncingScrollPhysics(),
-                        itemCount: models.length,
-                        itemBuilder: (context, index) {
-                          final modelName = models[index];
-                          return ListTile(
-                            contentPadding: const EdgeInsets.symmetric(
-                              horizontal: 8,
-                            ),
-                            title: Text(
-                              modelName,
-                              style: TextStyle(
-                                fontSize: 14,
-                                fontWeight: FontWeight.w500,
-                                color: isDark ? Colors.white70 : Colors.black87,
-                              ),
-                            ),
-                            trailing: const Icon(
-                              Icons.chevron_right_rounded,
-                              size: 18,
-                            ),
-                            onTap: () {
-                              setState(() {
-                                _modelController.text = modelName;
-                              });
-                              Navigator.pop(context);
-                            },
-                          );
-                        },
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            );
-          },
-        );
+      if (!mounted) return;
+      final selected = await showSearchableModelPicker(
+        context: context,
+        models: models,
+        title: AiService.isNvidiaBaseUrl(baseUrl)
+            ? 'Select a Free NVIDIA Model'
+            : 'Select a Model',
+      );
+      if (selected != null && mounted) {
+        setState(() => _modelController.text = selected);
       }
     } catch (e) {
       setState(() {

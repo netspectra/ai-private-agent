@@ -10,6 +10,10 @@ import 'task_history_screen.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import '../config/feature_flags.dart';
+import '../models/provider_profile.dart';
+import '../services/provider_profile_service.dart';
+import '../widgets/searchable_model_picker.dart';
+import 'memory_skills_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   final AiService aiService;
@@ -45,6 +49,9 @@ class _SettingsScreenState extends State<SettingsScreen>
   bool _useSystemPrompt = true;
   bool _floatingIconEnabled = false;
   bool _isOverlayPermissionGranted = false;
+  final ProviderProfileService _profileService = ProviderProfileService();
+  List<ProviderProfile> _customProfiles = [];
+  String? _selectedProfileId;
 
   final Map<String, PermissionStatus> _permissions = {};
 
@@ -76,6 +83,7 @@ class _SettingsScreenState extends State<SettingsScreen>
     _maxTokensController.addListener(_autoSave);
 
     _checkPermissions();
+    _loadProfiles();
     if (FeatureFlags.floatingOverlayEnabled) {
       _checkOverlayStatus();
     }
@@ -203,41 +211,172 @@ class _SettingsScreenState extends State<SettingsScreen>
       return;
     }
 
+    if (!mounted) return;
+    final selected = await showSearchableModelPicker(
+      context: context,
+      models: models,
+      title: AiService.isNvidiaBaseUrl(baseUrl)
+          ? 'Select a Free NVIDIA Model'
+          : 'Select a Model',
+    );
+    if (selected != null && mounted) {
+      setState(() => _modelController.text = selected);
+    }
+  }
+
+  Future<void> _loadProfiles() async {
+    final profiles = await _profileService.list();
+    final active = await _profileService.activeProfileId();
+    if (!mounted) return;
+    setState(() {
+      _customProfiles = profiles;
+      _selectedProfileId = profiles.any((item) => item.id == active)
+          ? active
+          : null;
+    });
+  }
+
+  Future<void> _applyProfile(String? profileId) async {
+    if (profileId == null) return;
+    final profile = _customProfiles.where((item) => item.id == profileId).first;
+    final apiKey = await _profileService.readApiKey(profile.id);
+    setState(() {
+      _selectedProfileId = profile.id;
+      _apiKeyController.text = apiKey;
+      _baseUrlController.text = profile.baseUrl;
+      _modelController.text = profile.model;
+      _temperature = profile.temperature;
+      _maxTokensController.text = profile.maxTokens.toString();
+      _maxSteps = profile.maxSteps.toDouble();
+      _disableMaxSteps = profile.disableMaxSteps;
+      _useScreenCompression = profile.useScreenCompression;
+      _useSystemPrompt = profile.useSystemPrompt;
+    });
+    await _profileService.setActive(profile.id);
+    _autoSave();
+  }
+
+  Future<void> _saveCustomProfile() async {
+    final nameController = TextEditingController(
+      text:
+          _customProfiles
+              .where((item) => item.id == _selectedProfileId)
+              .map((item) => item.name)
+              .firstOrNull ??
+          '',
+    );
+    final name = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Save Custom provider profile'),
+        content: TextField(
+          controller: nameController,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: 'Profile name',
+            hintText: 'Home Ollama, Work Groq…',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(dialogContext, nameController.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (name == null || name.isEmpty) return;
+    final existing = _customProfiles
+        .where((item) => item.id == _selectedProfileId)
+        .firstOrNull;
+    final now = DateTime.now();
+    final profile = ProviderProfile(
+      id: existing != null && existing.name == name
+          ? existing.id
+          : now.microsecondsSinceEpoch.toString(),
+      name: name,
+      baseUrl: _baseUrlController.text.trim(),
+      model: _modelController.text.trim(),
+      temperature: _temperature,
+      maxTokens: int.tryParse(_maxTokensController.text) ?? 1024,
+      maxSteps: _maxSteps.toInt(),
+      disableMaxSteps: _disableMaxSteps,
+      useScreenCompression: _useScreenCompression,
+      useSystemPrompt: _useSystemPrompt,
+      updatedAt: now,
+    );
+    await _profileService.save(profile, _apiKeyController.text.trim());
+    await _loadProfiles();
     if (mounted) {
-      final isNvidia = AiService.isNvidiaBaseUrl(baseUrl);
-      showDialog(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: Text(
-            isNvidia ? 'Select a Free NVIDIA Model' : 'Select a Model',
-          ),
-          content: SizedBox(
-            width: double.maxFinite,
-            height: 300,
-            child: ListView.builder(
-              itemCount: models.length,
-              itemBuilder: (context, index) {
-                return ListTile(
-                  title: Text(models[index]),
-                  onTap: () {
-                    setState(() {
-                      _modelController.text = models[index];
-                    });
-                    Navigator.pop(context);
-                  },
-                );
-              },
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel'),
+      setState(() => _selectedProfileId = profile.id);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Saved profile "$name".')));
+    }
+  }
+
+  Future<void> _deleteCustomProfile() async {
+    final id = _selectedProfileId;
+    if (id == null) return;
+    await _profileService.delete(id);
+    await _loadProfiles();
+  }
+
+  Widget _buildProfileActions() {
+    final hasSelectedProfile = _selectedProfileId != null;
+    final saveButton = OutlinedButton.icon(
+      onPressed: _saveCustomProfile,
+      icon: const Icon(Icons.save_outlined),
+      label: Text(
+        hasSelectedProfile
+            ? 'Update / Save as profile'
+            : 'Save as Custom profile',
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+    );
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (!hasSelectedProfile) {
+          return SizedBox(width: double.infinity, child: saveButton);
+        }
+
+        if (constraints.maxWidth < 360) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              saveButton,
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton.icon(
+                  onPressed: _deleteCustomProfile,
+                  icon: const Icon(Icons.delete_outline),
+                  label: const Text('Delete profile'),
+                ),
+              ),
+            ],
+          );
+        }
+
+        return Row(
+          children: [
+            Expanded(child: saveButton),
+            const SizedBox(width: 8),
+            IconButton(
+              tooltip: 'Delete selected profile',
+              onPressed: _deleteCustomProfile,
+              icon: const Icon(Icons.delete_outline),
             ),
           ],
-        ),
-      );
-    }
+        );
+      },
+    );
   }
 
   Widget _buildSettingsCard({
@@ -451,6 +590,31 @@ class _SettingsScreenState extends State<SettingsScreen>
             subtitle: 'Supports any OpenAI-compatible API endpoint',
             isDark: isDark,
             children: [
+              if (_customProfiles.isNotEmpty) ...[
+                DropdownButtonFormField<String>(
+                  initialValue: _selectedProfileId,
+                  decoration: _buildInputDecoration(
+                    labelText: 'Saved Custom profile',
+                    hintText: 'Choose a saved provider configuration',
+                    prefixIcon: const Icon(
+                      Icons.account_tree_outlined,
+                      size: 18,
+                    ),
+                  ),
+                  items: _customProfiles
+                      .map(
+                        (profile) => DropdownMenuItem(
+                          value: profile.id,
+                          child: Text(profile.name),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: _applyProfile,
+                ),
+                const SizedBox(height: 10),
+              ],
+              _buildProfileActions(),
+              const SizedBox(height: 12),
               TextField(
                 controller: _apiKeyController,
                 decoration: _buildInputDecoration(
@@ -526,6 +690,8 @@ class _SettingsScreenState extends State<SettingsScreen>
                     label: const Text('Custom', style: TextStyle(fontSize: 11)),
                     tooltip: 'Clear fields',
                     onPressed: () {
+                      _profileService.setActive(null);
+                      setState(() => _selectedProfileId = null);
                       _baseUrlController.clear();
                       _apiKeyController.clear();
                       _modelController.clear();
@@ -796,7 +962,30 @@ class _SettingsScreenState extends State<SettingsScreen>
             children: _buildPermissionTiles(),
           ),
 
-          // 8. Task History Card
+          // 8. Memory and Skills Card
+          _buildSettingsCard(
+            icon: Icons.psychology_alt_outlined,
+            title: 'Memory & Skills',
+            subtitle:
+                'Persistent recall, reusable procedures and learned workflows',
+            isDark: isDark,
+            children: [
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Manage Memory & Skills'),
+                subtitle: const Text(
+                  'Add durable facts, create /skills and review automatic learning',
+                ),
+                trailing: const Icon(Icons.arrow_forward_ios_rounded, size: 16),
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const MemorySkillsScreen()),
+                ),
+              ),
+            ],
+          ),
+
+          // 9. Task History Card
           _buildSettingsCard(
             icon: Icons.history_outlined,
             title: 'Execution logs',
@@ -822,7 +1011,7 @@ class _SettingsScreenState extends State<SettingsScreen>
             ],
           ),
 
-          // 9. About / Links Card
+          // 10. About / Links Card
           _buildSettingsCard(
             icon: Icons.info_outline_rounded,
             title: 'About PrivateAgent',
