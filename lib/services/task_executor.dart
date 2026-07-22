@@ -8,6 +8,7 @@ import 'notification_service.dart';
 import 'task_history_logger.dart';
 import 'shizuku_service.dart';
 import 'skill_memory_service.dart';
+import 'agent_memory_service.dart';
 import 'recovery_engine.dart';
 import '../models/saved_skill.dart';
 
@@ -276,7 +277,11 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       String response;
       try {
         _cancelCompleter = Completer<void>();
-        final aiFuture = _aiService.sendTaskMessage(_taskSystemPrompt, prompt);
+        final aiFuture = _aiService.sendTaskMessage(
+          _taskSystemPrompt,
+          prompt,
+          contextQuery: userGoal,
+        );
 
         // Race: whichever finishes first wins
         final result = await Future.any([
@@ -388,6 +393,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           final retryResponse = await _aiService.sendTaskMessage(
             _taskSystemPrompt,
             prompt,
+            contextQuery: userGoal,
           );
           totalTokens += retryResponse.totalTokens;
           developer.log(
@@ -531,6 +537,11 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
             reasoning.trim().isEmpty ? 'Agent finished its goal.' : reasoning,
           );
           await _screenService.showToast('Task completed');
+          await _skillMemory.saveSkill(userGoal, executedSteps);
+          await AgentMemoryService.instance.recordWorkflowLesson(
+            userGoal,
+            executedSteps,
+          );
           return reasoning.trim().isEmpty ? 'Done.' : reasoning.trim();
 
         default:
@@ -627,6 +638,10 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
 
         // Save to skill memory
         await _skillMemory.saveSkill(userGoal, executedSteps);
+        await AgentMemoryService.instance.recordWorkflowLesson(
+          userGoal,
+          executedSteps,
+        );
 
         await _screenService.showToast('Task Complete!');
         // Wait 4 seconds so the user can see the result before jumping back

@@ -46,6 +46,7 @@
 
     <application
         android:label="PrivateAgent"
+        android:allowBackup="false"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
 

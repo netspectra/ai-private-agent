@@ -1,5 +1,3 @@
-import 'dart:convert';
-
 class ActionStep {
   final String action;
   final Map<String, dynamic> params;
@@ -14,10 +12,7 @@ class ActionStep {
   }
 
   Map<String, dynamic> toJson() {
-    return {
-      'action': action,
-      'params': params,
-    };
+    return {'action': action, 'params': params};
   }
 }
 
@@ -29,6 +24,8 @@ class SavedSkill {
   int failCount;
   DateTime lastUsed;
   final List<ActionStep> steps;
+  bool enabled;
+  bool autoReplay;
 
   SavedSkill({
     required this.id,
@@ -38,9 +35,20 @@ class SavedSkill {
     this.failCount = 0,
     required this.lastUsed,
     required this.steps,
+    this.enabled = true,
+    this.autoReplay = false,
   });
 
-  bool get isReliable => successCount >= 1 && (failCount / (successCount + failCount)) < 0.3;
+  bool get isReliable =>
+      enabled &&
+      autoReplay &&
+      canAutoReplay &&
+      successCount >= 1 &&
+      (failCount / (successCount + failCount)) < 0.3;
+
+  bool get canAutoReplay => steps.every(
+    (step) => step.params['redacted'] != true && step.action != 'type_text',
+  );
 
   factory SavedSkill.fromJson(Map<String, dynamic> json) {
     return SavedSkill(
@@ -50,7 +58,13 @@ class SavedSkill {
       successCount: json['success_count'] as int? ?? 0,
       failCount: json['fail_count'] as int? ?? 0,
       lastUsed: DateTime.parse(json['last_used'] as String),
-      steps: (json['steps'] as List).map((s) => ActionStep.fromJson(s as Map<String, dynamic>)).toList(),
+      steps: (json['steps'] as List)
+          .map((s) => ActionStep.fromJson(s as Map<String, dynamic>))
+          .toList(),
+      enabled: json['enabled'] as bool? ?? true,
+      // Legacy skills are kept but are not silently replayed. The user may
+      // explicitly opt in after reviewing the recorded steps.
+      autoReplay: json['auto_replay'] as bool? ?? false,
     );
   }
 
@@ -63,6 +77,8 @@ class SavedSkill {
       'fail_count': failCount,
       'last_used': lastUsed.toIso8601String(),
       'steps': steps.map((s) => s.toJson()).toList(),
+      'enabled': enabled,
+      'auto_replay': autoReplay,
     };
   }
 }

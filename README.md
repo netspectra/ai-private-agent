@@ -18,6 +18,12 @@ The system operates on a continuous feedback loop:
 - **Coordinate-Based Interaction:** Simulates physical screen taps based on coordinate geometry, mitigating issues with missing text labels or inaccessible icons.
 - **Remote Access:** Integrates with the Telegram Bot API via background polling, allowing users to issue commands and monitor task execution progress remotely.
 - **Voice Control:** Native speech-to-text integration for hands-free operation.
+- **Persistent Memory:** Keeps user-approved facts and preferences available across chats and app restarts.
+- **User Skills:** Loads reusable procedures by slash command or trigger words.
+- **Provider Profiles:** Saves named OpenAI-compatible provider configurations and offers a searchable model picker.
+
+See [Memory, Skills, and Provider Profiles](docs/memory-skills-provider-profiles.md)
+for setup, usage, storage, and security details.
 
 ## Installation
 

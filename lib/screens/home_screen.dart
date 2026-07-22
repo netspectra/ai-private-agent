@@ -16,6 +16,8 @@ import 'task_history_screen.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import '../main.dart';
 import '../config/feature_flags.dart';
+import '../services/agent_memory_service.dart';
+import '../services/user_skill_service.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -96,6 +98,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _sendMessage(String text) async {
     if (text.trim().isEmpty) return;
+
+    final localResponse = await _handleKnowledgeCommand(text.trim());
+    if (localResponse != null) {
+      setState(() {
+        _messages.add(ChatMessage(role: 'user', content: text.trim()));
+        _messages.add(ChatMessage(role: 'assistant', content: localResponse));
+      });
+      _textController.clear();
+      _scrollToBottom();
+      await _saveSession();
+      return;
+    }
 
     final userMessage = ChatMessage(role: 'user', content: text.trim());
     setState(() {
@@ -232,6 +246,47 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _updateOverlayState();
       }
     }
+  }
+
+  Future<String?> _handleKnowledgeCommand(String text) async {
+    final lower = text.toLowerCase();
+    if (lower.startsWith('/remember ')) {
+      final content = text.substring('/remember '.length).trim();
+      try {
+        await AgentMemoryService.instance.upsert(
+          content: content,
+          category: 'general',
+          source: 'user',
+        );
+        return 'Remembered. This will be available in future sessions.';
+      } catch (error) {
+        return 'Memory was not saved: $error';
+      }
+    }
+    if (lower.startsWith('/forget ')) {
+      final query = text.substring('/forget '.length).trim().toLowerCase();
+      final matches = (await AgentMemoryService.instance.list())
+          .where((entry) => entry.content.toLowerCase().contains(query))
+          .toList();
+      if (matches.isEmpty) return 'No matching memory was found.';
+      if (matches.length > 1) {
+        return 'More than one memory matches. Open Settings → Memory & Skills to choose one.';
+      }
+      await AgentMemoryService.instance.delete(matches.single.id);
+      return 'Forgotten: ${matches.single.content}';
+    }
+    if (lower == '/memory') {
+      final entries = await AgentMemoryService.instance.list();
+      if (entries.isEmpty) return 'Long-term memory is empty.';
+      return 'Long-term memory:\n${entries.map((entry) => '- ${entry.content}').join('\n')}';
+    }
+    if (lower == '/skills') {
+      final catalog = await UserSkillService.instance.catalog();
+      return catalog.isEmpty
+          ? 'No user Skills are installed.'
+          : 'Available Skills:\n$catalog';
+    }
+    return null;
   }
 
   Future<void> _showTaskProgressOverlay(String message) async {
