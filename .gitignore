@@ -55,3 +55,20 @@ google-services.json
 
 # Local credentials bundled only into developer test builds
 /assets/local_config/ai_test_config.json
+
+# Knowledge Graph
+graphify-out
+.agents
+
+# Gradle and CMake caches
+**/.gradle/
+**/.cxx/
+android/build/
+local_plugins/**/build/
+
+# Massive C++ Source Trees for local LLM inference
+local_plugins/llama_flutter_android/android/src/main/cpp/llama.cpp/
+local_plugins/llama_flutter_android/ios/llama_cpp_src/
+
+# Temporary files
+scratch/

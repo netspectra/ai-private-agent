@@ -160,12 +160,18 @@ class _OnboardingScreenState extends State<OnboardingScreen>
       if (provider == 'deepseek') {
         _baseUrlController.text = 'https://api.deepseek.com';
         _modelController.text = 'deepseek-chat';
+      } else if (provider == 'google') {
+        _baseUrlController.text = 'https://generativelanguage.googleapis.com/v1beta/openai/';
+        _modelController.text = 'gemini-2.5-flash';
       } else if (provider == 'groq') {
         _baseUrlController.text = 'https://api.groq.com/openai/v1';
         _modelController.text = 'llama-3.3-70b-versatile';
       } else if (provider == 'nvidia') {
         _baseUrlController.text = AiService.nvidiaBaseUrl;
         _modelController.text = AiService.nvidiaDefaultModel;
+      } else if (provider == 'on_device') {
+        _baseUrlController.text = 'Local On-Device Inference';
+        _modelController.text = 'Select a Model';
       } else if (provider == 'ollama') {
         _baseUrlController.text = 'http://10.0.2.2:11434/v1';
         _modelController.text = 'gemma2';
@@ -199,6 +205,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
 
     if (_selectedProvider != 'ollama' &&
         _selectedProvider != 'local' &&
+        _selectedProvider != 'on_device' &&
         apiKey.isEmpty) {
       setState(() {
         _validationError = 'API Key is required for this provider.';
@@ -211,7 +218,8 @@ class _OnboardingScreenState extends State<OnboardingScreen>
       final models = await _aiService.fetchAvailableModels(baseUrl, apiKey);
       if (models.isNotEmpty ||
           _selectedProvider == 'ollama' ||
-          _selectedProvider == 'local') {
+          _selectedProvider == 'local' ||
+          _selectedProvider == 'on_device') {
         await _aiService.saveSettings(
           apiKey: apiKey,
           baseUrl: baseUrl,
@@ -1121,6 +1129,8 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                   isDark,
                 ),
                 const SizedBox(width: 10),
+                _buildProviderCard('google', 'Google', Icons.g_mobiledata_rounded, isDark),
+                const SizedBox(width: 10),
                 _buildProviderCard('groq', 'Groq', Icons.speed_rounded, isDark),
                 const SizedBox(width: 10),
                 _buildProviderCard(
@@ -1134,6 +1144,13 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                   'ollama',
                   'Ollama',
                   Icons.computer_rounded,
+                  isDark,
+                ),
+                const SizedBox(width: 10),
+                _buildProviderCard(
+                  'on_device',
+                  'On-Device',
+                  Icons.memory_rounded,
                   isDark,
                 ),
                 const SizedBox(width: 10),
@@ -1160,7 +1177,8 @@ class _OnboardingScreenState extends State<OnboardingScreen>
               physics: const BouncingScrollPhysics(),
               children: [
                 if (_selectedProvider != 'ollama' &&
-                    _selectedProvider != 'local') ...[
+                    _selectedProvider != 'local' &&
+                    _selectedProvider != 'on_device') ...[
                   _buildFormTextField(
                     controller: _apiKeyController,
                     label: 'API Key',
@@ -1180,38 +1198,60 @@ class _OnboardingScreenState extends State<OnboardingScreen>
                   ),
                   const SizedBox(height: 16),
                 ],
-                _buildFormTextField(
-                  controller: _baseUrlController,
-                  label: 'API Base URL',
-                  hint: 'https://api.deepseek.com',
-                  isDark: isDark,
-                ),
-                const SizedBox(height: 16),
-                _buildFormTextField(
-                  controller: _modelController,
-                  label: 'Model Name',
-                  hint: 'deepseek-chat',
-                  isDark: isDark,
-                  suffix: IconButton(
-                    icon: _isValidating
-                        ? SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              valueColor: AlwaysStoppedAnimation<Color>(
-                                isDark ? Colors.white : Colors.black,
-                              ),
-                            ),
-                          )
-                        : Icon(
-                            Icons.sync_rounded,
-                            color: isDark ? Colors.white : Colors.black,
-                          ),
-                    tooltip: 'Fetch models list',
-                    onPressed: _isValidating ? null : _fetchModels,
+                if (_selectedProvider != 'on_device') ...[
+                  _buildFormTextField(
+                    controller: _baseUrlController,
+                    label: 'API Base URL',
+                    hint: 'https://api.deepseek.com',
+                    isDark: isDark,
                   ),
-                ),
+                  const SizedBox(height: 16),
+                  _buildFormTextField(
+                    controller: _modelController,
+                    label: 'Model Name',
+                    hint: 'deepseek-chat',
+                    isDark: isDark,
+                    suffix: IconButton(
+                      icon: _isValidating
+                          ? SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                valueColor: AlwaysStoppedAnimation<Color>(
+                                  isDark ? Colors.white : Colors.black,
+                                ),
+                              ),
+                            )
+                          : Icon(
+                              Icons.sync_rounded,
+                              color: isDark ? Colors.white : Colors.black,
+                            ),
+                      tooltip: 'Fetch models list',
+                      onPressed: _isValidating ? null : _fetchModels,
+                    ),
+                  ),
+                ] else ...[
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.primary.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(Icons.info_outline, color: Theme.of(context).colorScheme.primary),
+                        const SizedBox(width: 12),
+                        const Expanded(
+                          child: Text(
+                            'Local Models require significant storage and can be configured and downloaded from the Home Screen after setup.',
+                            style: TextStyle(fontSize: 14),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
 
                 if (_validationError != null) ...[
                   const SizedBox(height: 16),

@@ -17,6 +17,7 @@
         android:name="android.permission.SYSTEM_ALERT_WINDOW"
         tools:node="remove" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <!-- For speech recognition -->
     <queries>
@@ -47,7 +48,9 @@
     <application
         android:label="PrivateAgent"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:largeHeap="true"
+        android:extractNativeLibs="true">
 
         <activity
             android:name=".MainActivity"

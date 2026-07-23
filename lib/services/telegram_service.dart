@@ -102,7 +102,12 @@ class TelegramService {
 
     try {
       // 1. Send text to AI
-      final aiResponse = await _aiService.sendMessage(text);
+      final aiResponse = await _aiService.sendMessage(
+        text,
+        onModelSwitch: (oldModel, newModel, reason) {
+          _sendMessage(chatId, '🔄 $reason for $oldModel. Automatically switched to $newModel...');
+        },
+      );
       
       // 2. Parse the action
       final action = _aiService.parseAction(aiResponse);

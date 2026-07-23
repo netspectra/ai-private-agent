@@ -1,8 +1,12 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:developer' as developer;
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/agent_action.dart';
+import 'local_inference_engine.dart';
+import 'model_manager_service.dart';
+import 'package:llama_flutter_android/llama_flutter_android.dart' show ChatMessage;
 
 class AiResponse {
   final String content;
@@ -57,6 +61,17 @@ class AiService {
   int _maxTokens = 1024;
   bool _useScreenCompression = true;
   bool _useSystemPrompt = true;
+  bool _autoSwitchModel = true;
+  bool _useOnDeviceInference = false;
+  String? _onDeviceModelFilename;
+  String? _defaultModelDownloadDir;
+  
+  final LocalInferenceEngine _localEngine = LocalInferenceEngine();
+  List<String> _importedModels = [];
+  
+  // Getters
+  List<String> get importedModels => _importedModels;
+  final ModelManagerService _modelManager = ModelManagerService();
   final List<Map<String, String>> _conversationHistory = [];
 
   static const String _systemPrompt = '''
@@ -116,6 +131,14 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     _maxTokens = prefs.getInt('api_max_tokens') ?? 1024;
     _useScreenCompression = prefs.getBool('api_use_screen_compression') ?? true;
     _useSystemPrompt = prefs.getBool('api_use_system_prompt') ?? true;
+    _autoSwitchModel = prefs.getBool('api_auto_switch_model') ?? true;
+    _useOnDeviceInference = prefs.getBool('api_use_on_device_inference') ?? false;
+    _onDeviceModelFilename = prefs.getString('api_on_device_model_filename');
+    _defaultModelDownloadDir = prefs.getString('api_default_model_download_dir');
+    _importedModels = prefs.getStringList('api_imported_models') ?? [];
+    
+    // Local models are now loaded lazily when the user sends a message
+    // or when explicitly requested, preventing OOM crashes on startup.
   }
 
   Future<void> saveSettings({
@@ -150,6 +173,12 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     await prefs.setInt('api_max_steps', steps);
   }
 
+  Future<void> saveAutoSwitchModel(bool autoSwitch) async {
+    final prefs = await SharedPreferences.getInstance();
+    _autoSwitchModel = autoSwitch;
+    await prefs.setBool('api_auto_switch_model', autoSwitch);
+  }
+
   Future<void> saveDisableMaxSteps(bool disable) async {
     final prefs = await SharedPreferences.getInstance();
     _disableMaxSteps = disable;
@@ -173,17 +202,111 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     await prefs.setBool('api_use_system_prompt', useSystemPrompt);
   }
 
-  bool get isConfigured => _apiKey != null && _apiKey!.isNotEmpty;
+  bool get isConfigured => 
+      _useOnDeviceInference || 
+      _baseUrl.contains('127.0.0.1') || 
+      (_apiKey != null && _apiKey!.isNotEmpty);
   String get baseUrl => _baseUrl;
   String get model => _model;
   String get apiKey => _apiKey ?? '';
-  int get maxSteps => _disableMaxSteps ? 999 : _maxSteps;
+  int get maxSteps => _disableMaxSteps ? 999999 : _maxSteps;
   int get rawMaxSteps => _maxSteps; // For the slider UI
   bool get disableMaxSteps => _disableMaxSteps;
   double get temperature => _temperature;
   int get maxTokens => _maxTokens;
   bool get useScreenCompression => _useScreenCompression;
   bool get useSystemPrompt => _useSystemPrompt;
+  bool get autoSwitchModel => _autoSwitchModel;
+  bool get useOnDeviceInference => _useOnDeviceInference;
+  bool get isLocalEngineInitialized => _localEngine.isInitialized;
+  
+  Future<void> ejectLocalModel() async {
+    await saveOnDeviceSettings(false, _onDeviceModelFilename);
+  }
+
+  String? get onDeviceModelFilename => _onDeviceModelFilename;
+  String? get defaultModelDownloadDir => _defaultModelDownloadDir;
+  ModelManagerService get modelManager => _modelManager;
+
+  Future<void> saveDefaultModelDownloadDir(String? dir) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (dir == null) {
+      await prefs.remove('api_default_model_download_dir');
+    } else {
+      await prefs.setString('api_default_model_download_dir', dir);
+    }
+    _defaultModelDownloadDir = dir;
+  }
+
+  Future<void> addImportedModel(String path) async {
+    if (!_importedModels.contains(path)) {
+      _importedModels.add(path);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList('api_imported_models', _importedModels);
+    }
+  }
+
+  Future<void> removeImportedModel(String path) async {
+    _importedModels.remove(path);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('api_imported_models', _importedModels);
+    // If we delete the active model, disable it
+    if (_useOnDeviceInference && _onDeviceModelFilename == path.split('/').last) {
+      await saveOnDeviceSettings(false, null);
+    }
+  }
+
+  Future<void> saveOnDeviceSettings(bool useOnDevice, String? filename, {bool autoLoad = true}) async {
+    final prefs = await SharedPreferences.getInstance();
+    _useOnDeviceInference = useOnDevice;
+    if (filename != null) {
+      _onDeviceModelFilename = filename;
+      await prefs.setString('api_on_device_model_filename', filename);
+    }
+    await prefs.setBool('api_use_on_device_inference', useOnDevice);
+    
+    if (useOnDevice && _onDeviceModelFilename != null && autoLoad) {
+      await initLocalModel();
+    } else if (!useOnDevice) {
+      await _localEngine.dispose();
+    }
+  }
+
+  Future<void> initLocalModel() async {
+    if (_onDeviceModelFilename == null) return;
+    try {
+      String? path;
+      if (defaultModelDownloadDir != null) {
+        final customFile = File('$defaultModelDownloadDir/$_onDeviceModelFilename');
+        if (await customFile.exists()) {
+          path = customFile.path;
+        }
+      }
+      if (path == null) {
+        for (var importedPath in _importedModels) {
+          if (importedPath.endsWith(_onDeviceModelFilename!)) {
+            final f = File(importedPath);
+            if (await f.exists()) {
+              path = f.path;
+            }
+            break;
+          }
+        }
+      }
+      if (path == null) {
+        path = await _modelManager.getModelPath(_onDeviceModelFilename!);
+      }
+      
+      if (path != null) {
+        await _localEngine.loadModel(path);
+      } else {
+        throw Exception('Model file not found on device.');
+      }
+    } catch (e) {
+      developer.log('Error loading local model: $e', name: 'AiService');
+      throw Exception('Failed to initialize local model: $e');
+    }
+  }
 
   int get _effectiveMaxTokens {
     // GLM is a reasoning model. With the app's 1,024-token default it can
@@ -208,17 +331,61 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   }
 
   /// Send a message to the AI and get a response.
-  Future<String> sendMessage(String message, {bool isAgentMode = true}) async {
+  
+  Future<bool> _tryAutoSwitchModel(String baseUrl, String apiKey, Function(String, String, String)? onModelSwitch, String reason, {Set<String>? attemptedModels}) async {
+    if (!_autoSwitchModel) return false;
+    try {
+      final models = await fetchAvailableModels(baseUrl, apiKey);
+      if (models.isNotEmpty) {
+        final validModels = models.where((m) => 
+          !m.toLowerCase().contains('embedding') && 
+          !m.toLowerCase().contains('aqa') &&
+          !m.toLowerCase().contains('vision') &&
+          !m.toLowerCase().contains('tts') &&
+          !m.toLowerCase().contains('audio') &&
+          !m.toLowerCase().contains('robotics') &&
+          !m.toLowerCase().contains('antigravity') &&
+          m != _model &&
+          !(attemptedModels?.contains(m) ?? false)
+        ).toList();
+        
+        if (validModels.isNotEmpty) {
+          String? newModel;
+          String currentFamily = _model.split('-').first.toLowerCase();
+          for (var m in validModels) {
+            if (m.toLowerCase().startsWith(currentFamily)) {
+              newModel = m;
+              break;
+            }
+          }
+          newModel ??= validModels.first;
+          
+          String oldModel = _model;
+          _model = newModel;
+          await saveSettings(apiKey: apiKey, baseUrl: baseUrl, model: _model);
+          if (onModelSwitch != null) {
+            onModelSwitch(oldModel, _model, reason);
+          }
+          return true;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  Future<String> sendMessage(String message, {bool isAgentMode = true, Function(String, String, String)? onModelSwitch, Set<String>? attemptedModels}) async {
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw Exception('API Key is not configured. Please go to Settings.');
     }
 
-    // Add ONLY the text to the persistent conversation history to save tokens.
-    _conversationHistory.add({'role': 'user', 'content': message});
+    if (attemptedModels == null) {
+      // Add ONLY the text to the persistent conversation history to save tokens.
+      _conversationHistory.add({'role': 'user', 'content': message});
 
-    // Keep conversation history manageable (last 20 messages)
-    if (_conversationHistory.length > 20) {
-      _conversationHistory.removeRange(0, _conversationHistory.length - 20);
+      // Keep conversation history manageable (last 20 messages)
+      if (_conversationHistory.length > 20) {
+        _conversationHistory.removeRange(0, _conversationHistory.length - 20);
+      }
     }
 
     try {
@@ -285,6 +452,20 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
         } catch (_) {
           // ignore parsing errors, use raw body
         }
+        
+        bool isInteractionsApiError = response.statusCode == 400 && errorMessage.contains('Interactions API');
+        if (response.statusCode == 429 || response.statusCode == 404 || response.statusCode >= 500 || isInteractionsApiError) {
+          attemptedModels ??= {};
+          attemptedModels.add(_model);
+          String reason = response.statusCode == 429 ? 'Rate limit reached' : (response.statusCode == 404 ? 'Model not found' : (isInteractionsApiError ? 'Interactions API required' : 'API Error (${response.statusCode})'));
+          bool switched = await _tryAutoSwitchModel(_baseUrl, _apiKey!, onModelSwitch, reason, attemptedModels: attemptedModels);
+          if (switched) {
+            return await sendMessage(message, isAgentMode: isAgentMode, onModelSwitch: onModelSwitch, attemptedModels: attemptedModels);
+          } else if (_baseUrl.toLowerCase().contains('google')) {
+            throw Exception('All models have hit rate limit. Check here https://aistudio.google.com/rate-limit try after sometime or change api key from different account.');
+          }
+        }
+        
         throw Exception('API error (${response.statusCode}): $errorMessage');
       }
 
@@ -296,9 +477,9 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
       String assistantMessage =
           data['choices'][0]['message']['content'] as String;
 
-      // Strip <think> blocks commonly produced by reasoning models
+      // Strip <think> and <thought> blocks commonly produced by reasoning models
       assistantMessage = assistantMessage
-          .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
+          .replaceAll(RegExp(r'<(think|thought)>.*?</\1>', dotAll: true), '')
           .trim();
 
       if (assistantMessage.trim().isEmpty) {
@@ -323,15 +504,36 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   Stream<String> sendMessageStream(
     String message, {
     bool isAgentMode = true,
+    Function(String, String, String)? onModelSwitch,
+    Set<String>? attemptedModels,
   }) async* {
-    if (_apiKey == null || _apiKey!.isEmpty) {
-      throw Exception('API Key is not configured. Please go to Settings.');
+    if (attemptedModels == null) {
+      _conversationHistory.add({'role': 'user', 'content': message});
+
+      if (_conversationHistory.length > 20) {
+        _conversationHistory.removeRange(0, _conversationHistory.length - 20);
+      }
     }
 
-    _conversationHistory.add({'role': 'user', 'content': message});
-
-    if (_conversationHistory.length > 20) {
-      _conversationHistory.removeRange(0, _conversationHistory.length - 20);
+    if (_useOnDeviceInference) {
+      if (!_localEngine.isInitialized) await initLocalModel();
+      final systemPrompt = isAgentMode ? _systemPrompt : _chatSystemPrompt;
+      
+      final messages = <ChatMessage>[];
+      if (_useSystemPrompt) {
+        messages.add(ChatMessage(role: 'system', content: systemPrompt));
+      }
+      for (var msg in _conversationHistory) {
+        messages.add(ChatMessage(role: msg['role'] ?? 'user', content: msg['content'] ?? ''));
+      }
+      
+      final accumulatedContent = StringBuffer();
+      await for (final token in _localEngine.generateChatStream(messages)) {
+        accumulatedContent.write(token);
+        yield token;
+      }
+      _conversationHistory.add({'role': 'assistant', 'content': accumulatedContent.toString().trim()});
+      return;
     }
 
     try {
@@ -387,6 +589,21 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
           }
         } catch (_) {}
         client.close();
+        
+        bool isInteractionsApiError = response.statusCode == 400 && errorMessage.contains('Interactions API');
+        if (response.statusCode == 429 || response.statusCode == 404 || response.statusCode >= 500 || isInteractionsApiError) {
+          attemptedModels ??= {};
+          attemptedModels.add(_model);
+          String reason = response.statusCode == 429 ? 'Rate limit reached' : (response.statusCode == 404 ? 'Model not found' : (isInteractionsApiError ? 'Interactions API required' : 'API Error (${response.statusCode})'));
+          bool switched = await _tryAutoSwitchModel(_baseUrl, _apiKey!, onModelSwitch, reason, attemptedModels: attemptedModels);
+          if (switched) {
+            yield* sendMessageStream(message, isAgentMode: isAgentMode, onModelSwitch: onModelSwitch, attemptedModels: attemptedModels);
+            return;
+          } else if (_baseUrl.toLowerCase().contains('google')) {
+            throw Exception('All models have hit rate limit. Check here https://aistudio.google.com/rate-limit try after sometime or change api key from different account.');
+          }
+        }
+        
         throw Exception('API error (${response.statusCode}): $errorMessage');
       }
 
@@ -418,18 +635,18 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
                   final content = rawContent;
                   accumulatedContent.write(content);
 
-                  // Handle <think> block stripping on the fly for better stream styling
-                  if (content.contains('<think>')) {
+                  // Handle <think> and <thought> block stripping on the fly for better stream styling
+                  if (content.contains('<think>') || content.contains('<thought>')) {
                     inThinkBlock = true;
-                    // If there is text before <think>, yield it
-                    final parts = content.split('<think>');
+                    final tag = content.contains('<think>') ? '<think>' : '<thought>';
+                    final parts = content.split(tag);
                     if (parts[0].isNotEmpty) {
                       yield parts[0];
                     }
-                  } else if (content.contains('</think>')) {
+                  } else if (content.contains('</think>') || content.contains('</thought>')) {
                     inThinkBlock = false;
-                    // If there is text after </think>, yield it
-                    final parts = content.split('</think>');
+                    final tag = content.contains('</think>') ? '</think>' : '</thought>';
+                    final parts = content.split(tag);
                     if (parts.length > 1 && parts[1].isNotEmpty) {
                       yield parts[1];
                     }
@@ -451,7 +668,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
       // Clean up final accumulated response and add to history
       String finalResponse = accumulatedContent.toString().trim();
       finalResponse = finalResponse
-          .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
+          .replaceAll(RegExp(r'<(think|thought)>.*?</\1>', dotAll: true), '')
           .trim();
 
       if (finalResponse.isEmpty) {
@@ -467,9 +684,18 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     }
   }
 
-  /// Send a task execution message — no conversation history, low temperature, limited tokens.
+  /// Sends a task message (used by the agent for internal steps).
   /// This is much faster and cheaper than sendMessage.
-  Future<AiResponse> sendTaskMessage(String systemPrompt, String prompt) async {
+  Future<AiResponse> sendTaskMessage(String systemPrompt, String prompt, {Function(String, String, String)? onModelSwitch, Set<String>? attemptedModels}) async {
+    if (_useOnDeviceInference) {
+      if (!_localEngine.isInitialized) await initLocalModel();
+      final messages = <ChatMessage>[
+        ChatMessage(role: 'system', content: systemPrompt),
+        ChatMessage(role: 'user', content: prompt),
+      ];
+      final responseStr = await _localEngine.generateChat(messages);
+      return AiResponse(responseStr.trim(), responseStr.length ~/ 4);
+    }
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw Exception('API Key is not configured. Please go to Settings.');
     }
@@ -526,6 +752,20 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
           } catch (_) {
             // ignore parsing errors, use raw body
           }
+          
+          bool isInteractionsApiError = response.statusCode == 400 && errorMessage.contains('Interactions API');
+          if (response.statusCode == 429 || response.statusCode == 404 || response.statusCode >= 500 || isInteractionsApiError) {
+            attemptedModels ??= {};
+            attemptedModels.add(_model);
+            String reason = response.statusCode == 429 ? 'Rate limit reached' : (response.statusCode == 404 ? 'Model not found' : (isInteractionsApiError ? 'Interactions API required' : 'API Error (${response.statusCode})'));
+            bool switched = await _tryAutoSwitchModel(_baseUrl, _apiKey!, onModelSwitch, reason, attemptedModels: attemptedModels);
+            if (switched) {
+              return await sendTaskMessage(systemPrompt, prompt, onModelSwitch: onModelSwitch, attemptedModels: attemptedModels);
+            } else if (_baseUrl.toLowerCase().contains('google')) {
+              throw Exception('All models have hit rate limit. Check here https://aistudio.google.com/rate-limit try after sometime or change api key from different account.');
+            }
+          }
+          
           throw Exception('API error (${response.statusCode}): $errorMessage');
         }
 
@@ -535,9 +775,9 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
         }
         String content = data['choices'][0]['message']['content'] as String;
 
-        // Strip <think> blocks commonly produced by reasoning models
+        // Strip <think> and <thought> blocks commonly produced by reasoning models
         content = content
-            .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
+            .replaceAll(RegExp(r'<(think|thought)>.*?</\1>', dotAll: true), '')
             .trim();
 
         if (content.trim().isEmpty) {
@@ -571,11 +811,14 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   AgentAction? parseAction(String response) {
     // Try to parse as JSON action
     try {
-      final trimmed = response.trim();
+      // Strip <think> and <thought> blocks first so JSON parsing works
+      String jsonStr = response
+          .replaceAll(RegExp(r'<(think|thought)>.*?</\1>', dotAll: true), '')
+          .trim();
+          
       // Handle if the response is wrapped in code fences
-      String jsonStr = trimmed;
-      if (trimmed.startsWith('```')) {
-        final lines = trimmed.split('\n');
+      if (jsonStr.startsWith('```')) {
+        final lines = jsonStr.split('\n');
         lines.removeAt(0); // Remove opening fence
         if (lines.isNotEmpty && lines.last.trim() == '```') {
           lines.removeLast(); // Remove closing fence
@@ -589,6 +832,12 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
       }
 
       if (jsonStr.startsWith('{') && jsonStr.contains('"action"')) {
+        // Attempt to fix missing commas before parsing (common in small local models)
+        // This matches a quote, closing brace, or bracket, followed by whitespace, followed by a quote, opening brace, or bracket.
+        jsonStr = jsonStr.replaceAllMapped(RegExp(r'("|\}|\])\s+("|\{|\[)'), (match) {
+          return '${match.group(1)}, ${match.group(2)}';
+        });
+
         try {
           final json = jsonDecode(jsonStr) as Map<String, dynamic>;
           if (json.containsKey('action')) {
@@ -598,10 +847,12 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
           // If it still fails, it might be deeply truncated, try adding another brace
           if (e.toString().contains('Unexpected end of input')) {
             jsonStr += '\n}';
-            final json = jsonDecode(jsonStr) as Map<String, dynamic>;
-            if (json.containsKey('action')) {
-              return AgentAction.fromJson(json);
-            }
+            try {
+              final json = jsonDecode(jsonStr) as Map<String, dynamic>;
+              if (json.containsKey('action')) {
+                return AgentAction.fromJson(json);
+              }
+            } catch (_) {}
           }
         }
       }
@@ -618,9 +869,38 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   ) async {
     try {
       String cleanBaseUrl = baseUrl;
+      if (cleanBaseUrl == 'Local On-Device Inference') {
+        List<String> localModels = [];
+        for (var path in _importedModels) {
+          localModels.add(path.split('/').last);
+        }
+        if (_defaultModelDownloadDir != null) {
+          final dir = Directory(_defaultModelDownloadDir!);
+          if (await dir.exists()) {
+            for (var file in dir.listSync()) {
+              if (file.path.endsWith('.gguf')) {
+                localModels.add(file.path.split('/').last);
+              }
+            }
+          }
+        }
+        final defaultDir = await _modelManager.getModelDirectory();
+        if (await defaultDir.exists()) {
+          for (var file in defaultDir.listSync()) {
+            if (file.path.endsWith('.gguf')) {
+              localModels.add(file.path.split('/').last);
+            }
+          }
+        }
+        return localModels.toSet().toList();
+      }
+
       // Many providers host it at /models, but some require the base URL without /chat/completions logic
       if (cleanBaseUrl.endsWith('/chat/completions')) {
         cleanBaseUrl = cleanBaseUrl.replaceAll('/chat/completions', '');
+      }
+      if (cleanBaseUrl.endsWith('/')) {
+        cleanBaseUrl = cleanBaseUrl.substring(0, cleanBaseUrl.length - 1);
       }
 
       final response = await http.get(
