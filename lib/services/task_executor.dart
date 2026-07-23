@@ -276,7 +276,13 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       String response;
       try {
         _cancelCompleter = Completer<void>();
-        final aiFuture = _aiService.sendTaskMessage(_taskSystemPrompt, prompt);
+        final aiFuture = _aiService.sendTaskMessage(
+          _taskSystemPrompt, 
+          prompt,
+          onModelSwitch: (oldModel, newModel, reason) {
+            _report('🔄 $reason for $oldModel. Automatically switched to $newModel.');
+          }
+        );
 
         // Race: whichever finishes first wins
         final result = await Future.any([

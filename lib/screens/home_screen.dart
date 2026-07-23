@@ -12,6 +12,7 @@ import '../services/telegram_service.dart';
 import '../services/chat_history_service.dart';
 import '../services/notification_service.dart';
 import 'settings_screen.dart';
+import 'local_models_screen.dart';
 import 'task_history_screen.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import '../main.dart';
@@ -112,12 +113,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() {
       _messages.add(assistantMessage);
     });
-    final assistantIndex = _messages.length - 1;
+    var assistantIndex = _messages.length - 1;
 
     try {
       final isAgent = _mode == 'agent';
       final stream = _aiService
-          .sendMessageStream(text.trim(), isAgentMode: isAgent)
+          .sendMessageStream(
+            text.trim(),
+            isAgentMode: isAgent,
+            onModelSwitch: (oldModel, newModel, reason) {
+              if (mounted) {
+                setState(() {
+                  _messages.insert(
+                    assistantIndex,
+                    ChatMessage(
+                      role: 'assistant',
+                      content: '🔄 $reason for $oldModel. Automatically switched to $newModel.',
+                    ),
+                  );
+                  assistantIndex++;
+                });
+                _scrollToBottom();
+              }
+            },
+          )
           .timeout(
             const Duration(seconds: 90),
             onTimeout: (sink) {
@@ -483,30 +502,82 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ? const Color(0xFF0C0A15)
           : const Color(0xFFFFFFFF),
       appBar: AppBar(
-        title: RichText(
-          text: TextSpan(
-            style: TextStyle(
-              fontSize: 20,
-              color: isDark ? Colors.white : const Color(0xFF1E293B),
-            ),
-            children: [
-              TextSpan(
-                text: 'Private',
+        title: Row(
+          children: [
+            RichText(
+              text: TextSpan(
                 style: TextStyle(
-                  fontWeight: FontWeight.w900,
-                  color: Theme.of(context).colorScheme.primary,
-                  letterSpacing: -0.5,
+                  fontSize: 20,
+                  color: isDark ? Colors.white : const Color(0xFF1E293B),
                 ),
+                children: [
+                  TextSpan(
+                    text: 'Private',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w900,
+                      color: Theme.of(context).colorScheme.primary,
+                      letterSpacing: -0.5,
+                    ),
+                  ),
+                  const TextSpan(
+                    text: 'Agent',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w400,
+                      letterSpacing: -0.5,
+                    ),
+                  ),
+                ],
               ),
-              const TextSpan(
-                text: 'Agent',
-                style: TextStyle(
-                  fontWeight: FontWeight.w400,
-                  letterSpacing: -0.5,
+            ),
+            if (_aiService.useOnDeviceInference && _aiService.isLocalEngineInitialized) ...[
+              const SizedBox(width: 8),
+              Expanded(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: Colors.greenAccent.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.greenAccent.withOpacity(0.3)),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 6,
+                        height: 6,
+                        decoration: const BoxDecoration(
+                          color: Colors.greenAccent,
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                      Expanded(
+                        child: Text(
+                          _aiService.onDeviceModelFilename?.replaceAll('_', ' ').replaceAll('.gguf', '') ?? 'Local Model',
+                          style: const TextStyle(fontSize: 10, color: Colors.green),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                      InkWell(
+                        onTap: () async {
+                          await _aiService.ejectLocalModel();
+                          if (mounted) {
+                            setState(() {});
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Model unloaded from memory.')),
+                            );
+                          }
+                        },
+                        child: const Icon(Icons.eject_rounded, size: 14, color: Colors.redAccent),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ],
-          ),
+          ],
         ),
         backgroundColor: Colors.transparent,
         scrolledUnderElevation: 0,
@@ -522,6 +593,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             icon: const Icon(Icons.add_comment_outlined),
             tooltip: 'New chat',
             onPressed: _isLoading ? null : _startNewChat,
+          ),
+          IconButton(
+            icon: const Icon(Icons.download_rounded),
+            tooltip: 'Local Models',
+            onPressed: () async {
+              await Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => LocalModelsScreen(
+                    aiService: _aiService,
+                    onModelChanged: () => setState(() {}),
+                  ),
+                ),
+              );
+            },
           ),
           // Settings Action
           IconButton(

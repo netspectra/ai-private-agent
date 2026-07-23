@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'local_models_screen.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../main.dart';
@@ -10,6 +12,7 @@ import 'task_history_screen.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import '../config/feature_flags.dart';
+import '../config/local_models_config.dart';
 
 class SettingsScreen extends StatefulWidget {
   final AiService aiService;
@@ -31,6 +34,11 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen>
     with WidgetsBindingObserver {
+  final Map<String, bool> _downloadingModels = {};
+  Map<String, String> _downloadingModelsSize = {};
+  final Map<String, double> _downloadProgress = {};
+  final Map<String, String> _downloadSpeed = {};
+  
   late TextEditingController _apiKeyController;
   late TextEditingController _baseUrlController;
   late TextEditingController _modelController;
@@ -45,6 +53,8 @@ class _SettingsScreenState extends State<SettingsScreen>
   bool _useSystemPrompt = true;
   bool _floatingIconEnabled = false;
   bool _isOverlayPermissionGranted = false;
+  bool _autoSwitchModel = true;
+  bool _useOnDevice = false;
 
   final Map<String, PermissionStatus> _permissions = {};
 
@@ -67,6 +77,8 @@ class _SettingsScreenState extends State<SettingsScreen>
     );
     _useScreenCompression = widget.aiService.useScreenCompression;
     _useSystemPrompt = widget.aiService.useSystemPrompt;
+    _autoSwitchModel = widget.aiService.autoSwitchModel;
+    _useOnDevice = widget.aiService.useOnDeviceInference;
 
     // Auto-save listeners
     _apiKeyController.addListener(_autoSave);
@@ -146,10 +158,22 @@ class _SettingsScreenState extends State<SettingsScreen>
   }
 
   void _autoSave() {
+    final baseUrl = _baseUrlController.text.trim();
+    if (baseUrl == 'Local On-Device Inference') {
+      _useOnDevice = true;
+    } else {
+      _useOnDevice = false;
+    }
+
     widget.aiService.saveSettings(
       apiKey: _apiKeyController.text.trim(),
-      baseUrl: _baseUrlController.text.trim(),
+      baseUrl: baseUrl,
       model: _modelController.text.trim(),
+    );
+    widget.aiService.saveOnDeviceSettings(
+      _useOnDevice,
+      _useOnDevice ? _modelController.text.trim() : null,
+      autoLoad: false,
     );
 
     widget.telegramService.saveSettings(
@@ -159,6 +183,7 @@ class _SettingsScreenState extends State<SettingsScreen>
 
     widget.aiService.saveMaxSteps(_maxSteps.toInt());
     widget.aiService.saveDisableMaxSteps(_disableMaxSteps);
+    widget.aiService.saveAutoSwitchModel(_autoSwitchModel);
     widget.aiService.saveAdvancedSettings(
       temperature: _temperature,
       maxTokens: int.tryParse(_maxTokensController.text) ?? 1024,
@@ -171,7 +196,7 @@ class _SettingsScreenState extends State<SettingsScreen>
     final baseUrl = _baseUrlController.text.trim();
     final apiKey = _apiKeyController.text.trim();
 
-    if (baseUrl.isEmpty || apiKey.isEmpty) {
+    if (!_useOnDevice && (baseUrl.isEmpty || apiKey.isEmpty)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Please enter Base URL and API Key first.'),
@@ -187,10 +212,14 @@ class _SettingsScreenState extends State<SettingsScreen>
       builder: (context) => const Center(child: CircularProgressIndicator()),
     );
 
-    final models = await widget.aiService.fetchAvailableModels(baseUrl, apiKey);
-
-    // Hide loading
-    if (mounted) Navigator.pop(context);
+    List<String> models = [];
+    if (_useOnDevice) {
+      models = await widget.aiService.modelManager.listDownloadedModels();
+      if (mounted) Navigator.pop(context);
+    } else {
+      models = await widget.aiService.fetchAvailableModels(baseUrl, apiKey);
+      if (mounted) Navigator.pop(context);
+    }
 
     if (models.isEmpty) {
       if (mounted) {
@@ -451,46 +480,90 @@ class _SettingsScreenState extends State<SettingsScreen>
             subtitle: 'Supports any OpenAI-compatible API endpoint',
             isDark: isDark,
             children: [
-              TextField(
-                controller: _apiKeyController,
-                decoration: _buildInputDecoration(
-                  labelText: 'API Key',
-                  hintText: 'sk-...',
-                  prefixIcon: const Icon(Icons.key_rounded, size: 18),
-                  suffixIcon: IconButton(
-                    icon: Icon(
-                      _obscureKey ? Icons.visibility_off : Icons.visibility,
-                      size: 18,
+              if (_baseUrlController.text != 'Local On-Device Inference') ...[
+                TextField(
+                  controller: _apiKeyController,
+                  decoration: _buildInputDecoration(
+                    labelText: 'API Key',
+                    hintText: 'sk-...',
+                    prefixIcon: const Icon(Icons.key_rounded, size: 18),
+                    suffixIcon: IconButton(
+                      icon: Icon(
+                        _obscureKey ? Icons.visibility_off : Icons.visibility,
+                        size: 18,
+                      ),
+                      onPressed: () => setState(() => _obscureKey = !_obscureKey),
                     ),
-                    onPressed: () => setState(() => _obscureKey = !_obscureKey),
+                  ),
+                  obscureText: _obscureKey,
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _baseUrlController,
+                  decoration: _buildInputDecoration(
+                    labelText: 'API Base URL',
+                    hintText: 'https://api.deepseek.com',
+                    prefixIcon: const Icon(Icons.dns_rounded, size: 18),
                   ),
                 ),
-                obscureText: _obscureKey,
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: _baseUrlController,
-                decoration: _buildInputDecoration(
-                  labelText: 'API Base URL',
-                  hintText: 'https://api.deepseek.com',
-                  prefixIcon: const Icon(Icons.dns_rounded, size: 18),
+                const SizedBox(height: 10),
+              ] else ...[
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.primary.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(Icons.memory, color: Theme.of(context).colorScheme.primary),
+                      const SizedBox(width: 12),
+                      const Expanded(
+                        child: Text(
+                          'On-Device Inference enabled. Tap the Sync button below to fetch downloaded models.',
+                          style: TextStyle(fontSize: 13),
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              const SizedBox(height: 10),
+                const SizedBox(height: 16),
+              ],
               Wrap(
                 spacing: 8,
                 runSpacing: 4,
                 children: [
                   ActionChip(
+                    avatar: const Icon(Icons.dns_rounded, size: 16),
                     label: const Text(
                       'Local Server',
                       style: TextStyle(fontSize: 11),
                     ),
-                    tooltip: 'For local Llama.cpp or LM Studio',
-                    onPressed: () =>
-                        _baseUrlController.text = 'http://192.168.1.X:8080/v1',
+                    tooltip: 'For local Llama.cpp, LM Studio, or Termux',
+                    onPressed: () {
+                      _baseUrlController.text = 'http://127.0.0.1:8080/v1';
+                      _modelController.text = 'qwen2.5-7b-instruct';
+                      _useOnDevice = false;
+                      setState(() {});
+                    },
                   ),
                   ActionChip(
+                    label: const Text(
+                      'On-Device',
+                      style: TextStyle(fontSize: 11),
+                    ),
+                    avatar: const Icon(Icons.memory_rounded, size: 16),
+                    tooltip: 'Run downloaded models locally',
+                    onPressed: () {
+                      _baseUrlController.text = 'Local On-Device Inference';
+                      _modelController.text = 'Select a Model';
+                      _apiKeyController.clear();
+                      _useOnDevice = true;
+                      setState(() {});
+                    },
+                  ),
+                  ActionChip(
+                    avatar: const Icon(Icons.computer_rounded, size: 16),
                     label: const Text(
                       'Ollama Cloud',
                       style: TextStyle(fontSize: 11),
@@ -498,17 +571,48 @@ class _SettingsScreenState extends State<SettingsScreen>
                     onPressed: () {
                       _baseUrlController.text = 'https://ollama.com/v1';
                       _modelController.text = 'gemma3:4b';
+                      _useOnDevice = false;
+                      setState(() {});
                     },
                   ),
                   ActionChip(
+                    avatar: const Icon(Icons.analytics_rounded, size: 16),
                     label: const Text(
                       'DeepSeek',
                       style: TextStyle(fontSize: 11),
                     ),
-                    onPressed: () =>
-                        _baseUrlController.text = 'https://api.deepseek.com',
+                    onPressed: () {
+                      _baseUrlController.text = 'https://api.deepseek.com';
+                      _modelController.text = 'deepseek-chat';
+                      _useOnDevice = false;
+                      setState(() {});
+                    },
                   ),
                   ActionChip(
+                    avatar: const Icon(Icons.developer_board_rounded, size: 16),
+                    label: const Text(
+                      'NVIDIA NIM',
+                      style: TextStyle(fontSize: 11),
+                    ),
+                    onPressed: () {
+                      _baseUrlController.text = 'https://integrate.api.nvidia.com/v1';
+                      _modelController.text = 'z-ai/glm-5.2';
+                      _useOnDevice = false;
+                      setState(() {});
+                    },
+                  ),
+                  ActionChip(
+                    avatar: const Icon(Icons.g_mobiledata_rounded, size: 16),
+                    label: const Text('Google', style: TextStyle(fontSize: 11)),
+                    onPressed: () {
+                      _baseUrlController.text = 'https://generativelanguage.googleapis.com/v1beta/openai/';
+                      _modelController.text = 'gemini-2.5-flash';
+                      _useOnDevice = false;
+                      setState(() {});
+                    },
+                  ),
+                  ActionChip(
+                    avatar: const Icon(Icons.speed_rounded, size: 16),
                     label: const Text('Groq', style: TextStyle(fontSize: 11)),
                     onPressed: () => _baseUrlController.text =
                         'https://api.groq.com/openai/v1',
@@ -523,6 +627,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                     },
                   ),
                   ActionChip(
+                    avatar: const Icon(Icons.settings_suggest_rounded, size: 16),
                     label: const Text('Custom', style: TextStyle(fontSize: 11)),
                     tooltip: 'Clear fields',
                     onPressed: () {
@@ -550,6 +655,57 @@ class _SettingsScreenState extends State<SettingsScreen>
                     ),
                   ),
                   const SizedBox(width: 8),
+                  if (_useOnDevice) ...[
+                    ElevatedButton.icon(
+                      onPressed: () async {
+                        final modelName = _modelController.text.trim();
+                        if (modelName.isEmpty || modelName == 'Select a Model') {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Please fetch and select a model first.')),
+                          );
+                          return;
+                        }
+                        showDialog(
+                          context: context,
+                          barrierDismissible: false,
+                          builder: (context) => const Center(child: CircularProgressIndicator()),
+                        );
+                        await widget.aiService.saveOnDeviceSettings(true, modelName, autoLoad: false);
+                        await widget.aiService.initLocalModel();
+                        if (mounted) {
+                          Navigator.pop(context);
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Local model loaded into memory!')),
+                          );
+                        }
+                      },
+                      icon: const Icon(
+                        Icons.memory,
+                        size: 18,
+                        color: Colors.white,
+                      ),
+                      label: const Text(
+                        'Load',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12,
+                        ),
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.green,
+                        elevation: 0,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 14,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
                   ElevatedButton.icon(
                     onPressed: _fetchModels,
                     icon: const Icon(
@@ -589,6 +745,20 @@ class _SettingsScreenState extends State<SettingsScreen>
             subtitle: 'Configure LLM agent parameters',
             isDark: isDark,
             children: [
+
+              SwitchListTile(
+                title: const Text('Auto-Switch Model on Rate Limit for Google Models'),
+                subtitle: const Text('Automatically try fallback models when limits are reached', style: TextStyle(fontSize: 12)),
+                value: _autoSwitchModel,
+                onChanged: (bool value) {
+                  setState(() {
+                    _autoSwitchModel = value;
+                  });
+                  _autoSave();
+                },
+                contentPadding: EdgeInsets.zero,
+              ),
+
               SwitchListTile(
                 title: const Text('Disable Maximum Steps'),
                 subtitle: const Text(
