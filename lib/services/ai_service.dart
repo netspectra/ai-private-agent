@@ -1,9 +1,21 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
-import 'package:flutter/services.dart' show rootBundle;
+import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/agent_action.dart';
+import '../models/ai_profile.dart';
+import 'image_attachment_service.dart';
+
+enum ConnectionTestResult {
+  success,
+  unauthorized,
+  notFound,
+  networkError,
+  timeout,
+  otherError,
+}
 
 class AiResponse {
   final String content;
@@ -14,6 +26,40 @@ class AiResponse {
 class AiService {
   static const String _defaultBaseUrl = 'https://api.deepseek.com';
   static const String _defaultModel = 'deepseek-chat';
+  static const String nvidiaBaseUrl = 'https://integrate.api.nvidia.com/v1';
+  static const String nvidiaDefaultModel = 'z-ai/glm-5.2';
+
+  /// Free, general-purpose chat endpoints verified in NVIDIA's NIM catalog.
+  /// The live /models response is intersected with this list so unavailable or
+  /// non-chat models never appear in PrivateAgent's NVIDIA model picker.
+  static const List<String> nvidiaFreeChatModels = [
+    'z-ai/glm-5.2',
+    'nvidia/nemotron-3-nano-30b-a3b',
+    'nvidia/nemotron-3-super-120b-a12b',
+    'nvidia/nemotron-3-ultra-550b-a55b',
+    'nvidia/nvidia-nemotron-nano-9b-v2',
+    'openai/gpt-oss-20b',
+    'openai/gpt-oss-120b',
+    'meta/llama-3.3-70b-instruct',
+    'meta/llama-3.2-3b-instruct',
+    'meta/llama-3.1-8b-instruct',
+    'meta/llama-3.1-70b-instruct',
+    'mistralai/mistral-nemotron',
+    'deepseek-ai/deepseek-v4-flash',
+    'deepseek-ai/deepseek-v4-pro',
+  ];
+
+  static bool isNvidiaBaseUrl(String baseUrl) {
+    final uri = Uri.tryParse(baseUrl.trim());
+    return uri?.host.toLowerCase() == 'integrate.api.nvidia.com';
+  }
+
+  static List<String> filterNvidiaFreeModels(Iterable<String> models) {
+    final availableModels = models.toSet();
+    return nvidiaFreeChatModels
+        .where(availableModels.contains)
+        .toList(growable: false);
+  }
 
   String? _apiKey;
   String _baseUrl = _defaultBaseUrl;
@@ -24,7 +70,56 @@ class AiService {
   int _maxTokens = 1024;
   bool _useScreenCompression = true;
   bool _useSystemPrompt = true;
-  final List<Map<String, String>> _conversationHistory = [];
+  final List<Map<String, dynamic>> _conversationHistory = [];
+  final ImageAttachmentService _imageAttachmentService =
+      ImageAttachmentService();
+
+  /// Model name fragments known to belong to vision-capable models. This is
+  /// only used to log a heads-up when attachments are sent to a model that
+  /// doesn't match — the request is still attempted either way, since this
+  /// list is never exhaustive and the provider's own error is authoritative.
+  static const List<String> _visionModelHints = [
+    'vision',
+    'vl-',
+    'llava',
+    'gpt-4o',
+    'gpt-4.1',
+    'claude-3',
+    'gemini',
+    'pixtral',
+  ];
+
+  bool _modelLikelySupportsVision(String model) {
+    final lower = model.toLowerCase();
+    return _visionModelHints.any(lower.contains);
+  }
+
+  /// Builds the OpenAI/NIM-compatible `content` value for a user message:
+  /// a plain string when there are no attachments, or a content-block list
+  /// (`text` + one `image_url` per attachment) for multimodal turns.
+  Future<dynamic> _buildContent(String text, List<String>? attachmentPaths) async {
+    if (attachmentPaths == null || attachmentPaths.isEmpty) return text;
+
+    if (!_modelLikelySupportsVision(_model)) {
+      developer.log(
+        'Sending ${attachmentPaths.length} attachment(s) to model "$_model", '
+        'which is not in the known vision-model list. Attempting anyway.',
+        name: 'AiService',
+      );
+    }
+
+    final blocks = <Map<String, dynamic>>[
+      {'type': 'text', 'text': text},
+    ];
+    for (final path in attachmentPaths) {
+      final uri = await _imageAttachmentService.toBase64DataUri(path);
+      blocks.add({
+        'type': 'image_url',
+        'image_url': {'url': uri},
+      });
+    }
+    return blocks;
+  }
 
   static const String _systemPrompt = '''
 You are PrivateAgent, a helpful AI assistant that controls an Android phone. You can perform device actions and also have normal conversations.
@@ -74,41 +169,15 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
 
   Future<void> init() async {
     final prefs = await SharedPreferences.getInstance();
-    final localConfig = await _loadLocalTestConfig();
-    _apiKey = localConfig?['apiKey'] ?? prefs.getString('api_key');
-    _baseUrl =
-        localConfig?['baseUrl'] ??
-        prefs.getString('api_base_url') ??
-        _defaultBaseUrl;
-    _model =
-        localConfig?['model'] ?? prefs.getString('api_model') ?? _defaultModel;
+    _apiKey = prefs.getString('api_key');
+    _baseUrl = prefs.getString('api_base_url') ?? _defaultBaseUrl;
+    _model = prefs.getString('api_model') ?? _defaultModel;
     _maxSteps = prefs.getInt('api_max_steps') ?? 15;
     _disableMaxSteps = prefs.getBool('api_disable_max_steps') ?? false;
     _temperature = prefs.getDouble('api_temperature') ?? 1.0;
     _maxTokens = prefs.getInt('api_max_tokens') ?? 1024;
     _useScreenCompression = prefs.getBool('api_use_screen_compression') ?? true;
     _useSystemPrompt = prefs.getBool('api_use_system_prompt') ?? true;
-  }
-
-  /// Loads developer-only credentials when the ignored local asset exists.
-  /// Release/source builds without this file continue to use saved settings.
-  Future<Map<String, String>?> _loadLocalTestConfig() async {
-    try {
-      final raw = await rootBundle.loadString(
-        'assets/local_config/ai_test_config.json',
-      );
-      final data = jsonDecode(raw);
-      if (data is! Map<String, dynamic>) return null;
-
-      final apiKey = data['apiKey']?.toString().trim() ?? '';
-      final baseUrl = data['baseUrl']?.toString().trim() ?? '';
-      final model = data['model']?.toString().trim() ?? '';
-      if (apiKey.isEmpty || baseUrl.isEmpty || model.isEmpty) return null;
-
-      return {'apiKey': apiKey, 'baseUrl': baseUrl, 'model': model};
-    } catch (_) {
-      return null;
-    }
   }
 
   Future<void> saveSettings({
@@ -178,6 +247,17 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   bool get useScreenCompression => _useScreenCompression;
   bool get useSystemPrompt => _useSystemPrompt;
 
+  int get _effectiveMaxTokens {
+    // GLM is a reasoning model. With the app's 1,024-token default it can
+    // consume the whole budget reasoning and finish without visible content.
+    if (isNvidiaBaseUrl(_baseUrl) &&
+        _model == nvidiaDefaultModel &&
+        _maxTokens < 4096) {
+      return 4096;
+    }
+    return _maxTokens;
+  }
+
   void clearHistory() {
     _conversationHistory.clear();
   }
@@ -190,13 +270,17 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   }
 
   /// Send a message to the AI and get a response.
-  Future<String> sendMessage(String message, {bool isAgentMode = true}) async {
+  Future<String> sendMessage(
+    String message, {
+    bool isAgentMode = true,
+    List<String>? attachments,
+  }) async {
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw Exception('API Key is not configured. Please go to Settings.');
     }
 
-    // Add ONLY the text to the persistent conversation history to save tokens.
-    _conversationHistory.add({'role': 'user', 'content': message});
+    final content = await _buildContent(message, attachments);
+    _conversationHistory.add({'role': 'user', 'content': content});
 
     // Keep conversation history manageable (last 20 messages)
     if (_conversationHistory.length > 20) {
@@ -226,7 +310,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
         'model': _model,
         'messages': messages,
         'temperature': _temperature,
-        'max_tokens': _maxTokens,
+        'max_tokens': _effectiveMaxTokens,
       });
 
       developer.log(
@@ -305,12 +389,14 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   Stream<String> sendMessageStream(
     String message, {
     bool isAgentMode = true,
+    List<String>? attachments,
   }) async* {
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw Exception('API Key is not configured. Please go to Settings.');
     }
 
-    _conversationHistory.add({'role': 'user', 'content': message});
+    final content = await _buildContent(message, attachments);
+    _conversationHistory.add({'role': 'user', 'content': content});
 
     if (_conversationHistory.length > 20) {
       _conversationHistory.removeRange(0, _conversationHistory.length - 20);
@@ -347,7 +433,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
         'model': _model,
         'messages': messages,
         'temperature': _temperature,
-        'max_tokens': _maxTokens,
+        'max_tokens': _effectiveMaxTokens,
         'stream': true,
       });
 
@@ -383,17 +469,21 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
       await for (final line in lineStream) {
         final trimmedLine = line.trim();
         if (trimmedLine.isEmpty) continue;
-        if (trimmedLine.startsWith('data: ')) {
-          final dataStr = trimmedLine.substring(6).trim();
+        if (trimmedLine.startsWith('data:')) {
+          final dataStr = trimmedLine.substring(5).trim();
           if (dataStr == '[DONE]') break;
           try {
             final json = jsonDecode(dataStr);
-            if (json is Map && json.containsKey('choices')) {
+            if (json is Map && json['choices'] is List) {
               final choices = json['choices'] as List;
               if (choices.isNotEmpty) {
-                final delta = choices[0]['delta'] as Map;
-                if (delta.containsKey('content')) {
-                  String content = delta['content'] as String;
+                final choice = choices[0];
+                if (choice is! Map) continue;
+                final rawDelta = choice['delta'];
+                final delta = rawDelta is Map ? rawDelta : const {};
+                final rawContent = delta['content'];
+                if (rawContent is String && rawContent.isNotEmpty) {
+                  final content = rawContent;
                   accumulatedContent.write(content);
 
                   // Handle <think> block stripping on the fly for better stream styling
@@ -415,6 +505,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
                     yield content;
                   }
                 }
+                if (choice['finish_reason'] != null) break;
               }
             }
           } catch (_) {
@@ -431,12 +522,13 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
           .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
           .trim();
 
-      if (finalResponse.isNotEmpty) {
-        _conversationHistory.add({
-          'role': 'assistant',
-          'content': finalResponse,
-        });
+      if (finalResponse.isEmpty) {
+        throw Exception(
+          'The model finished without a visible answer. Increase Max Tokens '
+          'or try another NVIDIA model.',
+        );
       }
+      _conversationHistory.add({'role': 'assistant', 'content': finalResponse});
     } catch (e) {
       if (e is Exception) rethrow;
       throw Exception('Network error: $e');
@@ -483,7 +575,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
                 'model': _model,
                 'messages': messages,
                 'temperature': _temperature,
-                'max_tokens': _maxTokens,
+                'max_tokens': _effectiveMaxTokens,
               }),
             )
             .timeout(const Duration(minutes: 30));
@@ -606,17 +698,134 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
+        List<String> models;
         if (data is Map && data.containsKey('data')) {
           final modelsList = data['data'] as List;
-          return modelsList.map((m) => m['id'].toString()).toList();
+          models = modelsList.map((m) => m['id'].toString()).toList();
         } else if (data is List) {
-          return data.map((m) => m['id'].toString()).toList();
+          models = data.map((m) => m['id'].toString()).toList();
+        } else {
+          return [];
         }
+
+        if (isNvidiaBaseUrl(cleanBaseUrl)) {
+          return filterNvidiaFreeModels(models);
+        }
+        models.sort();
+        return models;
       }
       return [];
     } catch (e) {
       print('Error fetching models: $e');
       return [];
     }
+  }
+
+  /// Validates a baseUrl/apiKey pair against the provider's /models endpoint,
+  /// distinguishing failure modes instead of collapsing them all to an empty
+  /// list like [fetchAvailableModels] does.
+  Future<(ConnectionTestResult, String?)> testConnection(
+    String baseUrl,
+    String apiKey,
+  ) async {
+    String cleanBaseUrl = baseUrl.trim();
+    if (cleanBaseUrl.endsWith('/chat/completions')) {
+      cleanBaseUrl = cleanBaseUrl.replaceAll('/chat/completions', '');
+    }
+    if (cleanBaseUrl.endsWith('/')) {
+      cleanBaseUrl = cleanBaseUrl.substring(0, cleanBaseUrl.length - 1);
+    }
+
+    try {
+      final response = await http
+          .get(
+            Uri.parse('$cleanBaseUrl/models'),
+            headers: {'Authorization': 'Bearer $apiKey'},
+          )
+          .timeout(const Duration(seconds: 8));
+
+      switch (response.statusCode) {
+        case 200:
+          return (ConnectionTestResult.success, null);
+        case 401:
+        case 403:
+          return (ConnectionTestResult.unauthorized, null);
+        case 404:
+          return (ConnectionTestResult.notFound, null);
+        default:
+          return (ConnectionTestResult.otherError, '${response.statusCode}');
+      }
+    } on TimeoutException {
+      return (ConnectionTestResult.timeout, null);
+    } on SocketException catch (e) {
+      return (ConnectionTestResult.networkError, e.message);
+    } on http.ClientException catch (e) {
+      return (ConnectionTestResult.networkError, e.message);
+    } catch (e) {
+      return (ConnectionTestResult.otherError, e.toString());
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Saved provider profiles
+  // ---------------------------------------------------------------------
+
+  static const String _profilesPrefsKey = 'ai_profiles';
+
+  Future<List<AiProfile>> listProfiles() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_profilesPrefsKey);
+    if (raw == null || raw.isEmpty) return [];
+    try {
+      final decoded = jsonDecode(raw) as List;
+      return decoded
+          .map((e) => AiProfile.fromJson(e as Map<String, dynamic>))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> saveProfile(AiProfile profile) async {
+    final prefs = await SharedPreferences.getInstance();
+    final profiles = await listProfiles();
+    final index = profiles.indexWhere((p) => p.id == profile.id);
+    if (index >= 0) {
+      profiles[index] = profile;
+    } else {
+      profiles.add(profile);
+    }
+    await prefs.setString(
+      _profilesPrefsKey,
+      jsonEncode(profiles.map((p) => p.toJson()).toList()),
+    );
+  }
+
+  Future<void> deleteProfile(String id) async {
+    final prefs = await SharedPreferences.getInstance();
+    final profiles = await listProfiles();
+    profiles.removeWhere((p) => p.id == id);
+    await prefs.setString(
+      _profilesPrefsKey,
+      jsonEncode(profiles.map((p) => p.toJson()).toList()),
+    );
+  }
+
+  Future<void> applyProfile(AiProfile profile) async {
+    await saveSettings(
+      apiKey: profile.apiKey,
+      baseUrl: profile.baseUrl,
+      model: profile.model,
+    );
+  }
+
+  AiProfile currentAsProfile(String name) {
+    return AiProfile(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      name: name,
+      apiKey: apiKey,
+      baseUrl: baseUrl,
+      model: model,
+    );
   }
 }

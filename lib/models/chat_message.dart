@@ -3,21 +3,25 @@ class ChatMessage {
   final String content;
   final DateTime timestamp;
   final AgentActionResult? actionResult;
+  final List<String>? attachments; // local file paths of attached images
 
   ChatMessage({
     required this.role,
     required this.content,
     DateTime? timestamp,
     this.actionResult,
+    this.attachments,
   }) : timestamp = timestamp ?? DateTime.now();
 
   bool get isUser => role == 'user';
+  bool get hasAttachments => attachments != null && attachments!.isNotEmpty;
 
   Map<String, dynamic> toJson() => {
         'role': role,
         'content': content,
         'timestamp': timestamp.toIso8601String(),
         'actionResult': actionResult?.toJson(),
+        'attachments': attachments,
       };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
@@ -27,6 +31,7 @@ class ChatMessage {
         actionResult: json['actionResult'] != null
             ? AgentActionResult.fromJson(json['actionResult'] as Map<String, dynamic>)
             : null,
+        attachments: (json['attachments'] as List?)?.cast<String>(),
       );
 }
 

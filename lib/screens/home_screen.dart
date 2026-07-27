@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
+import 'dart:io';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import '../models/chat_message.dart';
 import '../services/ai_service.dart';
 import '../services/action_handler.dart';
+import '../services/image_attachment_service.dart';
 import '../services/voice_service.dart';
 import '../widgets/message_bubble.dart';
 import '../services/telegram_service.dart';
@@ -15,6 +17,7 @@ import 'settings_screen.dart';
 import 'task_history_screen.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import '../main.dart';
+import '../config/feature_flags.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -30,9 +33,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final ActionHandler _actionHandler = ActionHandler();
   final VoiceService _voiceService = VoiceService();
   final NotificationService _notificationService = NotificationService();
+  final ImageAttachmentService _imageAttachmentService =
+      ImageAttachmentService();
   late final TelegramService _telegramService;
 
   final List<ChatMessage> _messages = [];
+  final List<String> _pendingAttachments = [];
   bool _isLoading = false;
   bool _isListening = false;
 
@@ -94,12 +100,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _sendMessage(String text) async {
-    if (text.trim().isEmpty) return;
+    if (text.trim().isEmpty && _pendingAttachments.isEmpty) return;
 
-    final userMessage = ChatMessage(role: 'user', content: text.trim());
+    final attachments = _pendingAttachments.isEmpty
+        ? null
+        : List<String>.from(_pendingAttachments);
+
+    final userMessage = ChatMessage(
+      role: 'user',
+      content: text.trim(),
+      attachments: attachments,
+    );
     setState(() {
       _messages.add(userMessage);
       _isLoading = true;
+      _pendingAttachments.clear();
     });
     _updateOverlayState();
     _textController.clear();
@@ -115,10 +130,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     try {
       final isAgent = _mode == 'agent';
-      final stream = _aiService.sendMessageStream(
-        text.trim(),
-        isAgentMode: isAgent,
-      );
+      final stream = _aiService
+          .sendMessageStream(
+            text.trim(),
+            isAgentMode: isAgent,
+            attachments: attachments,
+          )
+          .timeout(
+            const Duration(seconds: 90),
+            onTimeout: (sink) {
+              sink.addError(
+                TimeoutException(
+                  'The model did not return visible text within 90 seconds.',
+                ),
+              );
+              sink.close();
+            },
+          );
       String accumulated = '';
 
       await for (final chunk in stream) {
@@ -225,6 +253,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _showTaskProgressOverlay(String message) async {
+    if (!FeatureFlags.floatingOverlayEnabled) return;
     if (!await FlutterOverlayWindow.isPermissionGranted()) return;
 
     // Never cover PrivateAgent itself. The lifecycle observer will create the
@@ -253,6 +282,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   void _sendOverlayEvent(String type, String message) {
+    if (!FeatureFlags.floatingOverlayEnabled) return;
     final safeMessage = message.replaceAll('|', ' ');
     unawaited(
       FlutterOverlayWindow.shareData(
@@ -262,6 +292,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _sendOverlayHistorySnapshot() async {
+    if (!FeatureFlags.floatingOverlayEnabled) return;
     final history = base64Encode(
       utf8.encode(
         jsonEncode(_messages.map((message) => message.toJson()).toList()),
@@ -361,6 +392,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _startOverlayHistorySync() {
     _overlayHistoryTimer?.cancel();
+    if (!FeatureFlags.floatingOverlayEnabled) return;
     unawaited(_importOverlayChatHistory());
     _overlayHistoryTimer = Timer.periodic(const Duration(milliseconds: 500), (
       _,
@@ -377,6 +409,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _importOverlayChatHistory() async {
+    if (!FeatureFlags.floatingOverlayEnabled) return;
     if (_importingOverlayHistory) return;
     _importingOverlayHistory = true;
     try {
@@ -403,6 +436,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _importingOverlayHistory = false;
 
   Future<void> _updateOverlayState() async {
+    if (!FeatureFlags.floatingOverlayEnabled) return;
     final generation = ++_overlayUpdateGeneration;
     final isBackground = _appLifecycleState == AppLifecycleState.paused;
     final shouldBeActive = isBackground;
@@ -1245,12 +1279,125 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  Future<void> _pickImageAttachment() async {
+    final path = await _imageAttachmentService.pickFromGallery();
+    if (path != null && mounted) {
+      setState(() => _pendingAttachments.add(path));
+    }
+  }
+
+  Future<void> _captureScreenAttachment() async {
+    final path = await _imageAttachmentService.captureScreen(
+      _actionHandler.screenAutomation,
+    );
+    if (path != null && mounted) {
+      setState(() => _pendingAttachments.add(path));
+    } else if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not capture the screen.')),
+      );
+    }
+  }
+
+  void _removePendingAttachment(int index) {
+    setState(() => _pendingAttachments.removeAt(index));
+  }
+
+  Future<void> _showAttachmentOptions() async {
+    await showModalBottomSheet(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('Attach from gallery'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickImageAttachment();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.phone_android_outlined),
+              title: const Text('Attach current screen'),
+              onTap: () {
+                Navigator.pop(context);
+                _captureScreenAttachment();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAttachmentPreviewStrip(bool isDark) {
+    return Container(
+      height: 64,
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: _pendingAttachments.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
+        itemBuilder: (context, index) {
+          final path = _pendingAttachments[index];
+          return Stack(
+            clipBehavior: Clip.none,
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: Image.file(
+                  File(path),
+                  width: 56,
+                  height: 56,
+                  fit: BoxFit.cover,
+                ),
+              ),
+              Positioned(
+                top: -6,
+                right: -6,
+                child: GestureDetector(
+                  onTap: () => _removePendingAttachment(index),
+                  child: Container(
+                    decoration: const BoxDecoration(
+                      color: Colors.black87,
+                      shape: BoxShape.circle,
+                    ),
+                    padding: const EdgeInsets.all(2),
+                    child: const Icon(
+                      Icons.close_rounded,
+                      size: 14,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
   Widget _buildInputBar(bool isDark) {
     return Container(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
       decoration: const BoxDecoration(color: Colors.transparent),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          if (_pendingAttachments.isNotEmpty)
+            _buildAttachmentPreviewStrip(isDark),
+          Row(
+        children: [
+          // Attachment button
+          IconButton(
+            icon: Icon(
+              Icons.attach_file_rounded,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+            onPressed: _isLoading ? null : _showAttachmentOptions,
+          ),
           // Glowing Voice Mic button
           AnimatedContainer(
             duration: const Duration(milliseconds: 300),
@@ -1360,6 +1507,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
             ),
           ),
+        ],
+      ),
         ],
       ),
     );

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../main.dart';
+import '../models/ai_profile.dart';
 import '../services/ai_service.dart';
 import '../services/shizuku_service.dart';
 import '../services/screen_automation_service.dart';
@@ -9,6 +10,7 @@ import '../services/telegram_service.dart';
 import 'task_history_screen.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
+import '../config/feature_flags.dart';
 
 class SettingsScreen extends StatefulWidget {
   final AiService aiService;
@@ -44,6 +46,8 @@ class _SettingsScreenState extends State<SettingsScreen>
   bool _useSystemPrompt = true;
   bool _floatingIconEnabled = false;
   bool _isOverlayPermissionGranted = false;
+  bool _testingConnection = false;
+  List<AiProfile> _profiles = [];
 
   final Map<String, PermissionStatus> _permissions = {};
 
@@ -75,7 +79,15 @@ class _SettingsScreenState extends State<SettingsScreen>
     _maxTokensController.addListener(_autoSave);
 
     _checkPermissions();
-    _checkOverlayStatus();
+    if (FeatureFlags.floatingOverlayEnabled) {
+      _checkOverlayStatus();
+    }
+    _loadProfiles();
+  }
+
+  Future<void> _loadProfiles() async {
+    final profiles = await widget.aiService.listProfiles();
+    if (mounted) setState(() => _profiles = profiles);
   }
 
   Future<void> _checkOverlayStatus() async {
@@ -109,7 +121,9 @@ class _SettingsScreenState extends State<SettingsScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _checkPermissions();
-      _checkOverlayStatus();
+      if (FeatureFlags.floatingOverlayEnabled) {
+        _checkOverlayStatus();
+      }
     }
   }
 
@@ -125,7 +139,9 @@ class _SettingsScreenState extends State<SettingsScreen>
     for (final entry in perms.entries) {
       _permissions[entry.key] = await entry.value.status;
     }
-    final overlayGranted = await FlutterOverlayWindow.isPermissionGranted();
+    final overlayGranted = FeatureFlags.floatingOverlayEnabled
+        ? await FlutterOverlayWindow.isPermissionGranted()
+        : false;
     if (mounted) {
       setState(() {
         _isOverlayPermissionGranted = overlayGranted;
@@ -197,10 +213,13 @@ class _SettingsScreenState extends State<SettingsScreen>
     }
 
     if (mounted) {
+      final isNvidia = AiService.isNvidiaBaseUrl(baseUrl);
       showDialog(
         context: context,
         builder: (context) => AlertDialog(
-          title: const Text('Select a Model'),
+          title: Text(
+            isNvidia ? 'Select a Free NVIDIA Model' : 'Select a Model',
+          ),
           content: SizedBox(
             width: double.maxFinite,
             height: 300,
@@ -228,6 +247,132 @@ class _SettingsScreenState extends State<SettingsScreen>
         ),
       );
     }
+  }
+
+  Future<void> _testConnection() async {
+    final baseUrl = _baseUrlController.text.trim();
+    final apiKey = _apiKeyController.text.trim();
+
+    if (baseUrl.isEmpty || apiKey.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please enter Base URL and API Key first.'),
+        ),
+      );
+      return;
+    }
+
+    setState(() => _testingConnection = true);
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const Center(child: CircularProgressIndicator()),
+    );
+
+    final (result, detail) = await widget.aiService.testConnection(
+      baseUrl,
+      apiKey,
+    );
+
+    if (mounted) Navigator.pop(context);
+    setState(() => _testingConnection = false);
+    if (!mounted) return;
+
+    String message;
+    Color color;
+    switch (result) {
+      case ConnectionTestResult.success:
+        message = 'Connection successful.';
+        color = Colors.green;
+        break;
+      case ConnectionTestResult.unauthorized:
+        message = 'Connection failed: invalid API key.';
+        color = Colors.redAccent;
+        break;
+      case ConnectionTestResult.notFound:
+        message = 'Connection failed: endpoint not found. Check Base URL.';
+        color = Colors.redAccent;
+        break;
+      case ConnectionTestResult.timeout:
+        message = 'Connection failed: request timed out.';
+        color = Colors.redAccent;
+        break;
+      case ConnectionTestResult.networkError:
+        message = 'Connection failed: network error${detail != null ? ' ($detail)' : ''}.';
+        color = Colors.redAccent;
+        break;
+      case ConnectionTestResult.otherError:
+        message = 'Connection failed${detail != null ? ' (HTTP $detail)' : ''}.';
+        color = Colors.redAccent;
+        break;
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), backgroundColor: color),
+    );
+  }
+
+  Future<void> _saveCurrentAsProfile() async {
+    final nameController = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Save current config as profile'),
+        content: TextField(
+          controller: nameController,
+          autofocus: true,
+          decoration: const InputDecoration(hintText: 'Profile name'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, nameController.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+
+    if (name == null || name.isEmpty) return;
+
+    await widget.aiService.saveProfile(widget.aiService.currentAsProfile(name));
+    await _loadProfiles();
+  }
+
+  Future<void> _applyProfile(AiProfile profile) async {
+    await widget.aiService.applyProfile(profile);
+    setState(() {
+      _apiKeyController.text = profile.apiKey;
+      _baseUrlController.text = profile.baseUrl;
+      _modelController.text = profile.model;
+    });
+  }
+
+  Future<void> _deleteProfile(AiProfile profile) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete profile?'),
+        content: Text('Delete "${profile.name}"? This cannot be undone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    await widget.aiService.deleteProfile(profile.id);
+    await _loadProfiles();
   }
 
   Widget _buildSettingsCard({
@@ -504,6 +649,15 @@ class _SettingsScreenState extends State<SettingsScreen>
                         'https://api.groq.com/openai/v1',
                   ),
                   ActionChip(
+                    avatar: const Icon(Icons.memory_rounded, size: 16),
+                    label: const Text('NVIDIA', style: TextStyle(fontSize: 11)),
+                    tooltip: 'NVIDIA NIM free endpoints',
+                    onPressed: () {
+                      _baseUrlController.text = AiService.nvidiaBaseUrl;
+                      _modelController.text = AiService.nvidiaDefaultModel;
+                    },
+                  ),
+                  ActionChip(
                     label: const Text('Custom', style: TextStyle(fontSize: 11)),
                     tooltip: 'Clear fields',
                     onPressed: () {
@@ -527,6 +681,30 @@ class _SettingsScreenState extends State<SettingsScreen>
                           Icons.smart_toy_rounded,
                           size: 18,
                         ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: _testingConnection ? null : _testConnection,
+                    icon: _testingConnection
+                        ? const SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.wifi_tethering_rounded, size: 18),
+                    label: const Text(
+                      'Test',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 14,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
                       ),
                     ),
                   ),
@@ -560,6 +738,53 @@ class _SettingsScreenState extends State<SettingsScreen>
                   ),
                 ],
               ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Text(
+                    'Saved Profiles',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: isDark ? Colors.grey[400] : Colors.grey[600],
+                    ),
+                  ),
+                  const Spacer(),
+                  TextButton.icon(
+                    onPressed: _saveCurrentAsProfile,
+                    icon: const Icon(Icons.save_outlined, size: 16),
+                    label: const Text(
+                      'Save current as...',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+              if (_profiles.isNotEmpty)
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 4,
+                  children: [
+                    for (final profile in _profiles)
+                      InputChip(
+                        label: Text(
+                          profile.name,
+                          style: const TextStyle(fontSize: 11),
+                        ),
+                        onPressed: () => _applyProfile(profile),
+                        onDeleted: () => _deleteProfile(profile),
+                        deleteIconColor: Colors.redAccent,
+                      ),
+                  ],
+                )
+              else
+                Text(
+                  'No saved profiles yet.',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: isDark ? Colors.grey[600] : Colors.grey[400],
+                  ),
+                ),
             ],
           ),
 
@@ -679,54 +904,55 @@ class _SettingsScreenState extends State<SettingsScreen>
                 },
                 contentPadding: EdgeInsets.zero,
               ),
-              SwitchListTile(
-                title: const Text('Enable Floating Agent Icon'),
-                subtitle: const Text('Assign tasks without opening the app'),
-                value: _floatingIconEnabled,
-                onChanged: (val) async {
-                  if (val) {
-                    bool? isGranted =
-                        await FlutterOverlayWindow.isPermissionGranted();
-                    if (isGranted != true) {
-                      bool? result =
-                          await FlutterOverlayWindow.requestPermission();
-                      if (result != true) {
-                        if (mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text(
-                                'Permission to draw over other apps is required.',
+              if (FeatureFlags.floatingOverlayEnabled)
+                SwitchListTile(
+                  title: const Text('Enable Floating Agent Icon'),
+                  subtitle: const Text('Assign tasks without opening the app'),
+                  value: _floatingIconEnabled,
+                  onChanged: (val) async {
+                    if (val) {
+                      bool? isGranted =
+                          await FlutterOverlayWindow.isPermissionGranted();
+                      if (isGranted != true) {
+                        bool? result =
+                            await FlutterOverlayWindow.requestPermission();
+                        if (result != true) {
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text(
+                                  'Permission to draw over other apps is required.',
+                                ),
                               ),
-                            ),
-                          );
+                            );
+                          }
+                          return;
                         }
-                        return;
+                      }
+                      if (await FlutterOverlayWindow.isActive() == false) {
+                        await FlutterOverlayWindow.showOverlay(
+                          enableDrag: true,
+                          overlayTitle: "PrivateAgent",
+                          overlayContent: "Floating Assistant",
+                          flag: OverlayFlag.focusPointer,
+                          alignment: OverlayAlignment.centerRight,
+                          visibility: NotificationVisibility.visibilitySecret,
+                          positionGravity: PositionGravity.auto,
+                          startPosition: const OverlayPosition(0, 200),
+                          width: 56,
+                          height: 56,
+                        );
+                      }
+                    } else {
+                      if (await FlutterOverlayWindow.isActive() == true) {
+                        await FlutterOverlayWindow.closeOverlay();
                       }
                     }
-                    if (await FlutterOverlayWindow.isActive() == false) {
-                      await FlutterOverlayWindow.showOverlay(
-                        enableDrag: true,
-                        overlayTitle: "PrivateAgent",
-                        overlayContent: "Floating Assistant",
-                        flag: OverlayFlag.focusPointer,
-                        alignment: OverlayAlignment.centerRight,
-                        visibility: NotificationVisibility.visibilitySecret,
-                        positionGravity: PositionGravity.auto,
-                        startPosition: const OverlayPosition(0, 200),
-                        width: 56,
-                        height: 56,
-                      );
-                    }
-                  } else {
-                    if (await FlutterOverlayWindow.isActive() == true) {
-                      await FlutterOverlayWindow.closeOverlay();
-                    }
-                  }
-                  setState(() => _floatingIconEnabled = val);
-                  _autoSave();
-                },
-                contentPadding: EdgeInsets.zero,
-              ),
+                    setState(() => _floatingIconEnabled = val);
+                    _autoSave();
+                  },
+                  contentPadding: EdgeInsets.zero,
+                ),
             ],
           ),
 
@@ -907,38 +1133,39 @@ class _SettingsScreenState extends State<SettingsScreen>
       );
     }).toList();
 
-    // Add Overlay Permission tile
-    list.add(
-      ListTile(
-        leading: const Icon(Icons.layers),
-        title: const Text('Display Over Other Apps (Floating Bubble)'),
-        trailing: _isOverlayPermissionGranted
-            ? Icon(
-                Icons.check_circle,
-                color: Theme.of(context).colorScheme.primary,
-              )
-            : TextButton(
-                onPressed: () async {
-                  await FlutterOverlayWindow.requestPermission();
-                  final granted =
-                      await FlutterOverlayWindow.isPermissionGranted();
-                  setState(() {
-                    _isOverlayPermissionGranted = granted;
-                  });
-                },
-                child: const Text('Grant'),
-              ),
-        subtitle: Text(
-          _isOverlayPermissionGranted ? 'Granted' : 'Not granted',
-          style: TextStyle(
-            color: _isOverlayPermissionGranted
-                ? Theme.of(context).colorScheme.primary
-                : Colors.orange,
-            fontSize: 12,
+    if (FeatureFlags.floatingOverlayEnabled) {
+      list.add(
+        ListTile(
+          leading: const Icon(Icons.layers),
+          title: const Text('Display Over Other Apps (Floating Bubble)'),
+          trailing: _isOverlayPermissionGranted
+              ? Icon(
+                  Icons.check_circle,
+                  color: Theme.of(context).colorScheme.primary,
+                )
+              : TextButton(
+                  onPressed: () async {
+                    await FlutterOverlayWindow.requestPermission();
+                    final granted =
+                        await FlutterOverlayWindow.isPermissionGranted();
+                    setState(() {
+                      _isOverlayPermissionGranted = granted;
+                    });
+                  },
+                  child: const Text('Grant'),
+                ),
+          subtitle: Text(
+            _isOverlayPermissionGranted ? 'Granted' : 'Not granted',
+            style: TextStyle(
+              color: _isOverlayPermissionGranted
+                  ? Theme.of(context).colorScheme.primary
+                  : Colors.orange,
+              fontSize: 12,
+            ),
           ),
         ),
-      ),
-    );
+      );
+    }
 
     return list;
   }

@@ -1,7 +1,7 @@
 name: private_agent
 description: "AI agent for Android"
 publish_to: "none"
-version: 1.0.1+2020
+version: 1.0.2+2021
 
 environment:
   sdk: ^3.10.3
@@ -31,6 +31,9 @@ dependencies:
   # Storage
   shared_preferences: ^2.3.0
   path_provider: ^2.1.0
+
+  # Attachments
+  image_picker: ^1.1.2
 
   # Notifications
   flutter_local_notifications: ^18.0.0
@@ -66,4 +69,3 @@ flutter:
   uses-material-design: true
   assets:
     - assets/
-    - assets/local_config/
